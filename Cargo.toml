@@ -1,0 +1,13 @@
+[package]
+name = "beanstream"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
+tokio = { version = "1.35", features = ["full"] }
+url = "2.5"
+ipnet = "2.9"
+backoff = { version = "0.4", features = ["tokio"] }
+serde = { version = "1.0", features = ["derive"] }
+thiserror = "1.0"
