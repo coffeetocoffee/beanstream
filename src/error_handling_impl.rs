@@ -38,6 +38,8 @@ pub enum BeanStreamError {
     InvalidConfiguration(String),
     #[error("Internal error: {0}")]
     InternalError(String),
+    #[error("Request was aborted")]
+    RequestAborted,
 }
 
 impl From<url::ParseError> for BeanStreamError {

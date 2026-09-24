@@ -1,14 +1,39 @@
+use std::sync::Arc;
 use std::time::Duration;
 
 use reqwest::header::{HeaderName, HeaderValue};
 use reqwest::{Client, Method};
 
+use crate::abort::AbortSignal;
 use crate::header_validation::{is_blocked_header, sanitize_header, validate_headers};
+use crate::progress::UploadProgress;
 use crate::redirect_policy::{RedirectPolicy, ScopeValidator};
 use crate::url_validation::{validate_url, ParsedUrl};
 use crate::{BeanStreamError, Result};
 
+/// Response returned by [`HttpRequest::send`].
 #[derive(Debug, Clone)]
+pub struct HttpResponse {
+    pub status: u16,
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
+    pub url: String,
+}
+
+impl HttpResponse {
+    pub fn text(&self) -> Result<String> {
+        String::from_utf8(self.body.clone()).map_err(|e| BeanStreamError::InternalError(e.to_string()))
+    }
+
+    pub fn bytes(&self) -> &[u8] {
+        &self.body
+    }
+
+    pub fn is_success(&self) -> bool {
+        (200..300).contains(&self.status)
+    }
+}
+
 pub struct HttpRequest {
     pub method: Method,
     pub url: String,
@@ -18,6 +43,43 @@ pub struct HttpRequest {
     pub timeout: Duration,
     pub redirect_policy: RedirectPolicy,
     pub scope_validator: ScopeValidator,
+    pub abort_signal: Option<AbortSignal>,
+    progress: Option<Arc<dyn UploadProgress>>,
+}
+
+// Manual Debug: skip progress trait object
+impl std::fmt::Debug for HttpRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HttpRequest")
+            .field("method", &self.method)
+            .field("url", &self.url)
+            .field("parsed_url", &self.parsed_url)
+            .field("headers", &self.headers)
+            .field("body", &self.body)
+            .field("timeout", &self.timeout)
+            .field("redirect_policy", &self.redirect_policy)
+            .field("scope_validator", &self.scope_validator)
+            .field("abort_signal", &self.abort_signal)
+            .field("has_progress", &self.progress.is_some())
+            .finish()
+    }
+}
+
+impl Clone for HttpRequest {
+    fn clone(&self) -> Self {
+        Self {
+            method: self.method.clone(),
+            url: self.url.clone(),
+            parsed_url: self.parsed_url.clone(),
+            headers: self.headers.clone(),
+            body: self.body.clone(),
+            timeout: self.timeout,
+            redirect_policy: self.redirect_policy.clone(),
+            scope_validator: self.scope_validator.clone(),
+            abort_signal: self.abort_signal.clone(),
+            progress: self.progress.clone(),
+        }
+    }
 }
 
 impl HttpRequest {
@@ -55,6 +117,8 @@ impl HttpRequest {
             timeout: Duration::from_secs(30),
             redirect_policy: RedirectPolicy::default(),
             scope_validator,
+            abort_signal: None,
+            progress: None,
         })
     }
 
@@ -103,6 +167,33 @@ impl HttpRequest {
         self
     }
 
+    /// Attach an abort signal (P0-2). If aborted, `send().await` returns `RequestAborted`.
+    pub fn with_signal(mut self, signal: AbortSignal) -> Self {
+        self.abort_signal = Some(signal);
+        self
+    }
+
+    /// Alias for `with_signal` to match `execute_with_abort` naming.
+    pub fn abort_signal(mut self, signal: AbortSignal) -> Self {
+        self.abort_signal = Some(signal);
+        self
+    }
+
+    /// Attach progress tracker (P0-3).
+    pub fn with_progress<P>(mut self, progress: P) -> Self
+    where
+        P: UploadProgress,
+    {
+        self.progress = Some(Arc::new(progress));
+        self
+    }
+
+    /// Attach already-boxed progress trait object.
+    pub fn with_progress_arc(mut self, progress: Arc<dyn UploadProgress>) -> Self {
+        self.progress = Some(progress);
+        self
+    }
+
     pub fn validate(&self) -> Result<()> {
         self.scope_validator.check_url(&self.url)?;
         validate_headers(&self.headers)
@@ -130,6 +221,91 @@ impl HttpRequest {
         }
 
         request.build().map_err(Into::into)
+    }
+
+    // --- P0-1: actual HTTP execution ---
+
+    async fn execute_inner(&self) -> Result<HttpResponse> {
+        self.validate()?;
+
+        // P0-3: progress hook — report upload start/end; abort if callback returns false
+        if let Some(progress) = &self.progress {
+            let total = self.body.as_ref().map(|b| b.len() as u64);
+            if !progress.on_progress(0, total) {
+                return Err(BeanStreamError::RequestAborted);
+            }
+        }
+
+        let client = Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(self.timeout)
+            .build()?;
+
+        let mut request = client.request(self.method.clone(), &self.url);
+        for (name, value) in &self.headers {
+            let name = HeaderName::from_bytes(name.as_bytes())
+                .map_err(|_| BeanStreamError::HeaderError("Invalid header name".to_string()))?;
+            let value = HeaderValue::from_str(value)
+                .map_err(|_| BeanStreamError::HeaderError("Invalid header value".to_string()))?;
+            request = request.header(name, value);
+        }
+        if let Some(body) = &self.body {
+            request = request.body(body.clone());
+        }
+
+        let response = request.send().await.map_err(|e| {
+            // Map timeout explicitly
+            if e.is_timeout() {
+                BeanStreamError::NetworkTimeout(self.timeout.as_millis() as u64)
+            } else {
+                BeanStreamError::RequestFailed(e.to_string())
+            }
+        })?;
+
+        let status = response.status().as_u16();
+        let url = response.url().to_string();
+        let headers = response
+            .headers()
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string()))
+            .collect::<Vec<_>>();
+
+        // Keep body accessible even for 4xx/5xx — caller can inspect status
+
+        let body = response
+            .bytes()
+            .await
+            .map_err(|e| BeanStreamError::RequestFailed(e.to_string()))?
+            .to_vec();
+
+        if !crate::progress::report_complete(&self.progress, body.len() as u64) {
+            return Err(BeanStreamError::RequestAborted);
+        }
+
+        Ok(HttpResponse { status, headers, body, url })
+    }
+
+    /// Execute the request — actually sends over the network (P0-1).
+    /// Honors attached `AbortSignal` (P0-2) and `UploadProgress` (P0-3).
+    pub async fn send(&self) -> Result<HttpResponse> {
+        if let Some(signal) = &self.abort_signal {
+            if signal.is_aborted() {
+                return Err(BeanStreamError::RequestAborted);
+            }
+            // Clone self to move into async branch
+            let this = self.clone();
+            tokio::select! {
+                res = this.execute_inner() => res,
+                _ = signal.cancelled() => Err(BeanStreamError::RequestAborted),
+            }
+        } else {
+            self.execute_inner().await
+        }
+    }
+
+    /// Convenience: send consuming self.
+    pub async fn execute(self) -> Result<HttpResponse> {
+        self.send().await
     }
 }
 
@@ -188,5 +364,36 @@ mod tests {
     fn builds_without_following_redirects() {
         let request = HttpRequest::get("https://8.8.8.8/redirect").unwrap();
         assert!(request.build_request().is_ok());
+    }
+
+    #[tokio::test]
+    async fn send_with_abort_signal_already_aborted() {
+        use crate::abort::AbortController;
+        let controller = AbortController::new();
+        controller.abort();
+        let req = HttpRequest::get("https://8.8.8.8/")
+            .unwrap()
+            .with_signal(controller.signal());
+        let res = req.send().await;
+        assert!(matches!(res, Err(BeanStreamError::RequestAborted)));
+    }
+
+    #[tokio::test]
+    async fn progress_callback_invoked_on_send() {
+        use crate::progress::UploadProgress;
+
+        // A tracker that always returns false must abort the request before it
+        // touches the network (progress hook runs prior to sending).
+        struct AbortTracker;
+        impl UploadProgress for AbortTracker {
+            fn on_progress(&self, _uploaded: u64, _total: Option<u64>) -> bool {
+                false
+            }
+        }
+        let req = HttpRequest::get("https://8.8.8.8/")
+            .unwrap()
+            .with_progress(AbortTracker);
+        let res = req.send().await;
+        assert!(matches!(res, Err(BeanStreamError::RequestAborted)));
     }
 }
