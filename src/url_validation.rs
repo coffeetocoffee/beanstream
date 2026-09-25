@@ -4,13 +4,24 @@ use url::Url;
 
 use crate::{BeanStreamError, Result};
 
+/// The URL schemes BeanStream can talk to.
+///
+/// Deliberately only two variants. A scheme with no host — `data:`, `file:`,
+/// `javascript:` — has no address to run the private-network checks against, so
+/// it cannot be supported by this validation model. Anything not listed here is
+/// refused with [`BeanStreamError::InvalidScheme`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Scheme {
+    /// Plain HTTP. No transport encryption.
     Http,
+    /// HTTP over TLS.
     Https,
 }
 
 impl Scheme {
+    /// Parse a scheme name case-insensitively. Returns `None` for anything other
+    /// than `http` and `https`, which callers turn into
+    /// [`BeanStreamError::InvalidScheme`].
     pub fn parse_scheme(value: &str) -> Option<Self> {
         match value.to_ascii_lowercase().as_str() {
             "http" => Some(Self::Http),
@@ -19,6 +30,7 @@ impl Scheme {
         }
     }
 
+    /// The lowercase scheme name as it appears in a URL.
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Http => "http",
@@ -27,9 +39,21 @@ impl Scheme {
     }
 }
 
+/// A host that survived name validation.
+///
+/// For an IP-literal URL, `ip_addr` is already populated and no DNS lookup is
+/// needed. For a domain, `ip_addr` is `None` here because resolution is
+/// deliberately deferred to a non-blocking lookup at connect time — see
+/// [`is_blocked_ip`] and [`validate_url_async`].
+///
+/// Domain *names* are still screened synchronously: `localhost`, `*.localhost`,
+/// `*.local` and `*.internal` are refused by name, since they conventionally
+/// resolve inside a private network.
 #[derive(Debug, Clone)]
 pub struct ValidatedHost {
+    /// The host as written, lowercased by `Url::parse`.
     pub host: String,
+    /// The address, present only when the URL used an IP literal.
     pub ip_addr: Option<IpAddr>,
 }
 
@@ -92,14 +116,23 @@ fn path_has_dangerous_sequence(path: &str) -> bool {
     })
 }
 
+/// The path portion of a validated URL.
+///
+/// Note that this runs *after* `Url::parse`, which already collapses `..`
+/// segments and decodes percent-escapes. So this catches what survives parsing
+/// — encoded traversal that decoding reveals, backslashes, NUL — while literal
+/// traversal in the raw string is caught earlier by [`validate_url`].
 #[derive(Debug, Clone)]
 pub struct SanitizedPath(String);
 
 impl SanitizedPath {
+    /// Wrap a path string. Construction does not validate; call
+    /// [`Self::contains_dangerous_sequences`] to check it.
     pub fn new(path: &str) -> Self {
         Self(path.to_string())
     }
 
+    /// The path as a string slice.
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -115,12 +148,34 @@ impl SanitizedPath {
     }
 }
 
+/// A URL that has passed every validation check.
+///
+/// Produced by [`validate_url`] and [`validate_url_async`]. Carries the pieces
+/// that were checked, so callers can inspect what was validated rather than
+/// re-parsing the string.
+///
+/// ```
+/// use beanstream::{validate_url, Scheme};
+///
+/// let parsed = validate_url("https://8.8.8.8/api")?;
+/// assert_eq!(parsed.scheme, Scheme::Https);
+/// assert_eq!(parsed.port, 443);          // default filled in
+/// assert_eq!(parsed.path.as_str(), "/api");
+/// assert!(parsed.host.ip_addr.is_some()); // IP literal, no DNS needed
+/// # Ok::<(), beanstream::BeanStreamError>(())
+/// ```
 #[derive(Debug, Clone)]
 pub struct ParsedUrl {
+    /// The validated scheme: always `http` or `https`.
     pub scheme: Scheme,
+    /// The validated host, with its address when the URL used an IP literal.
     pub host: ValidatedHost,
+    /// The port, defaulted to 80 or 443 based on the scheme when the URL omits
+    /// it. Port `0` is rejected.
     pub port: u16,
+    /// The path, checked for dangerous sequences.
     pub path: SanitizedPath,
+    /// The original URL text, preserved unchanged.
     pub original_url: String,
 }
 
@@ -130,6 +185,18 @@ fn ipv4_in_network(address: Ipv4Addr, network: [u8; 4], prefix: u8) -> bool {
         .unwrap_or(false)
 }
 
+/// Whether an IPv4 address is in a private, loopback, reserved or multicast
+/// range and must not be reached.
+///
+/// Covered: `0.0.0.0/8`, `10/8`, `100.64/10` (CGNAT), `127/8` (loopback),
+/// `169.254/16` (link-local, including cloud metadata endpoints),
+/// `172.16/12`, `192.0.0/24`, `192.0.2/24`, `192.168/16`, `198.18/15`
+/// (benchmarking), `198.51.100/24`, `203.0.113/24` (documentation) and
+/// `224/4` + `240/4` (multicast and reserved).
+///
+/// **Loopback is included.** There is no "localhost is fine" exception; a caller
+/// that needs an internal host opts in via
+/// [`HttpClientBuilder::allow_private_networks`](crate::HttpClientBuilder::allow_private_networks).
 pub fn is_private_or_loopback(address: &Ipv4Addr) -> bool {
     ipv4_in_network(*address, [0, 0, 0, 0], 8)
         || ipv4_in_network(*address, [10, 0, 0, 0], 8)
@@ -154,6 +221,21 @@ fn embedded_ipv4(address: &Ipv6Addr) -> Option<Ipv4Addr> {
     address.to_ipv4()
 }
 
+/// Whether an IPv6 address is unspecified, loopback, multicast, or in a range
+/// that must not be reached.
+///
+/// Covered: `::` (unspecified), `::1` (loopback), multicast, `fc00::/7`
+/// (unique-local), `fe80::/10` (link-local) and `2001:db8::/32`
+/// (documentation).
+///
+/// Two subtleties, both deliberate:
+///
+/// - **IPv4-mapped and IPv4-compatible addresses defer to the IPv4 rules on the
+///   embedded address**, so `::ffff:8.8.8.8` is allowed while
+///   `::ffff:127.0.0.1` is blocked. Blocking the whole form would refuse
+///   legitimate traffic; allowing the whole form would be an SSRF bypass.
+/// - **6to4 (`2002::/16`) is blocked only when the embedded IPv4 is itself
+///   private**, so public 6to4 tunnels still work.
 pub fn is_ipv6_loopback_or_multicast(address: &Ipv6Addr) -> bool {
     let segments = address.segments();
 
@@ -191,6 +273,9 @@ pub fn is_ipv6_loopback_or_multicast(address: &Ipv6Addr) -> bool {
         || is_6to4_private
 }
 
+/// Whether an address of either family must be blocked. The single entry point
+/// for "is this destination safe", dispatching to
+/// [`is_private_or_loopback`] or [`is_ipv6_loopback_or_multicast`].
 pub fn is_blocked_ip(address: &IpAddr) -> bool {
     match address {
         IpAddr::V4(address) => is_private_or_loopback(address),
@@ -203,6 +288,10 @@ pub fn is_blocked_ip(address: &IpAddr) -> bool {
 /// This never stalls the async runtime: the underlying `getaddrinfo` call is
 /// offloaded to Tokio's blocking thread pool. Use this instead of the blocking
 /// [`validate_ip_access`] from async code.
+///
+/// The addresses are returned deduplicated and in resolver order. An empty
+/// result is reported as [`BeanStreamError::InvalidHost`] rather than `Ok(vec![])`,
+/// so a caller cannot mistake "did not resolve" for "resolved to nothing".
 pub async fn resolve_host(host: &str) -> Result<Vec<IpAddr>> {
     let socket_addresses = tokio::net::lookup_host((host, 0u16))
         .await
@@ -369,6 +458,44 @@ fn validate_raw_url_path(url: &str) -> Result<()> {
     Ok(())
 }
 
+/// Validate `url` synchronously, without any DNS resolution.
+///
+/// Checks, in order:
+///
+/// 1. **Raw-string traversal** before parsing, because `Url::parse` normalizes
+///    `/api/../secret` to `/secret` and would hide it.
+/// 2. **Scheme** — only `http` and `https`; anything else is
+///    [`BeanStreamError::InvalidScheme`].
+/// 3. **Embedded credentials** — `https://user:pass@host/` is refused, since
+///    credentials in a URL leak into logs and redirects.
+/// 4. **Port** — `0` is refused; an omitted port becomes 80 or 443.
+/// 5. **Path** — dangerous sequences surviving parsing are refused.
+/// 6. **Host** — a domain name of the wrong shape or a reserved name
+///    (`localhost`, `*.local`, `*.internal`) is refused; an IP literal is
+///    checked against the private/reserved ranges.
+///
+/// This performs **no DNS lookup**, so a domain that resolves privately passes
+/// here. Address validation for domains happens at connect time: [`validate_url_async`]
+/// checks it eagerly, and [`HttpRequest::send`](crate::HttpRequest::send) pins
+/// the validated addresses so there is no re-resolution window.
+///
+/// ```
+/// use beanstream::{validate_url, BeanStreamError};
+///
+/// assert!(validate_url("https://8.8.8.8/api").is_ok());
+///
+/// // Loopback is refused like any other private address.
+/// assert!(matches!(
+///     validate_url("http://127.0.0.1/api"),
+///     Err(BeanStreamError::PrivateNetworkAccess(_))
+/// ));
+/// assert!(validate_url("http://localhost/api").is_err());
+///
+/// // Credentials and non-http schemes are refused.
+/// assert!(validate_url("https://user:pass@example.com/").is_err());
+/// assert!(validate_url("file:///etc/passwd").is_err());
+/// # Ok::<(), beanstream::BeanStreamError>(())
+/// ```
 pub fn validate_url(url: &str) -> Result<ParsedUrl> {
     // P1-6: reject traversal in the raw input before parsing normalizes it.
     validate_raw_url_path(url)?;

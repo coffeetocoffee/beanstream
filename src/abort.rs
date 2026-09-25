@@ -13,17 +13,27 @@ struct Inner {
     notify: Notify,
 }
 
+/// The cancellation handle handed to a request, or shared with the task that may
+/// cancel it.
+///
+/// Cloning is cheap and shares state, so every clone observes the same abort.
+/// Once aborted a signal stays aborted — there is no reset.
 #[derive(Debug, Clone)]
 pub struct AbortSignal {
     inner: Arc<Inner>,
 }
 
+/// The cancelling side of an abort pair: creates a [`AbortSignal`] and can fire
+/// it.
+///
+/// Typically created with [`create_abort_signal`], which returns both halves.
 #[derive(Debug)]
 pub struct AbortController {
     inner: Arc<Inner>,
 }
 
 impl AbortController {
+    /// Create a controller with a fresh, un-aborted signal.
     pub fn new() -> Self {
         Self {
             inner: Arc::new(Inner {
@@ -33,17 +43,22 @@ impl AbortController {
         }
     }
 
+    /// The signal for this controller. Calling twice yields signals sharing the
+    /// same state.
     pub fn signal(&self) -> AbortSignal {
         AbortSignal {
             inner: self.inner.clone(),
         }
     }
 
+    /// Mark the request as cancelled and wake anything awaiting
+    /// [`AbortSignal::cancelled`]. Idempotent.
     pub fn abort(&self) {
         self.inner.aborted.store(true, Ordering::SeqCst);
         self.inner.notify.notify_waiters();
     }
 
+    /// Whether [`Self::abort`] has been called.
     pub fn is_aborted(&self) -> bool {
         self.inner.aborted.load(Ordering::SeqCst)
     }
@@ -64,10 +79,14 @@ impl Clone for AbortController {
 }
 
 impl AbortSignal {
+    /// Whether the paired controller has fired. A request that starts with an
+    /// already-aborted signal fails immediately without opening a connection.
     pub fn is_aborted(&self) -> bool {
         self.inner.aborted.load(Ordering::SeqCst)
     }
 
+    /// Resolve once the paired controller aborts. Returns immediately if it
+    /// already has.
     pub async fn cancelled(&self) {
         loop {
             if self.is_aborted() {
@@ -80,17 +99,37 @@ impl AbortSignal {
         }
     }
 
+    /// Clearer-named alias for [`Self::cancelled`]; the intended use is racing
+    /// this against a request inside `tokio::select!`.
     pub async fn wait_aborted(&self) {
         self.cancelled().await
     }
 }
 
+/// Create a linked [`AbortController`] and [`AbortSignal`].
+///
+/// This is the usual entry point:
+///
+/// ```
+/// use beanstream::create_abort_signal;
+///
+/// let (controller, signal) = create_abort_signal();
+/// assert!(!signal.is_aborted());
+/// controller.abort();
+/// assert!(signal.is_aborted());
+/// ```
 pub fn create_abort_signal() -> (AbortController, AbortSignal) {
     let controller = AbortController::new();
     let signal = controller.signal();
     (controller, signal)
 }
 
+/// Run `request`, giving up with [`BeanStreamError::RequestAborted`] if `signal`
+/// fires first.
+///
+/// The request is consumed, so this is the form to use when the request is built
+/// at the call site. An already-aborted signal fails before any connection is
+/// attempted.
 pub async fn execute_with_abort(
     request: crate::request_handler::HttpRequest,
     signal: AbortSignal,
@@ -104,6 +143,8 @@ pub async fn execute_with_abort(
     }
 }
 
+/// As [`execute_with_abort`], but borrows the request and clones it internally,
+/// leaving the caller's value usable.
 pub async fn execute_with_abort_ref(
     request: &crate::request_handler::HttpRequest,
     signal: &AbortSignal,

@@ -4,11 +4,22 @@ use dashmap::DashMap;
 
 use crate::request_handler::HttpResponse;
 
+/// How long responses are kept, and which headers are trusted to say so.
 #[derive(Debug, Clone)]
 pub struct CacheConfig {
+    /// Lifetime for a response whose headers give no caching instructions.
+    /// Defaults to 5 minutes.
     pub default_ttl: Duration,
+    /// Store and expose the `ETag` header so callers can issue conditional
+    /// `GET`s. Defaults to `true`.
     pub use_etags: bool,
+    /// Honour `Cache-Control`: `no-store` and `no-cache` prevent caching
+    /// entirely, and `max-age=N` overrides [`Self::default_ttl`]. Defaults to
+    /// `true`.
     pub use_cache_control: bool,
+    /// Upper bound on stored entries. Once reached, one entry is evicted to make
+    /// room — an expired one if any, otherwise an arbitrary one. Defaults to
+    /// 10,000.
     pub max_size: usize,
 }
 
@@ -37,6 +48,17 @@ impl CacheEntry {
     }
 }
 
+/// A concurrent, in-process response cache keyed by method and URL.
+///
+/// Attach with [`HttpRequest::with_cache`](crate::HttpRequest::with_cache). The
+/// cache holds **redacted** responses, since redaction happens before storage —
+/// so a cached entry cannot leak a token that a fresh response would have
+/// stripped.
+///
+/// Keys are `"<METHOD> <url>"`, uppercased, so `GET` and `get` share an entry.
+/// Expiry is checked on read: an expired entry is removed and reported as a
+/// miss. [`Self::insert`] silently does nothing when the resolved TTL is zero,
+/// which is how `Cache-Control: no-store` is enforced.
 #[derive(Debug)]
 pub struct InMemoryCache {
     config: CacheConfig,
@@ -44,6 +66,7 @@ pub struct InMemoryCache {
 }
 
 impl InMemoryCache {
+    /// Create a cache with the given policy.
     pub fn new(config: CacheConfig) -> Self {
         Self {
             config,
@@ -51,14 +74,19 @@ impl InMemoryCache {
         }
     }
 
+    /// The policy this cache was built with.
     pub fn config(&self) -> &CacheConfig {
         &self.config
     }
 
+    /// Build the key used for `method` and `url`, so callers can compute the
+    /// same key the cache does.
     pub fn cache_key(method: &str, url: &str) -> String {
         format!("{} {}", method.to_ascii_uppercase(), url)
     }
 
+    /// Return a stored response, or `None` on a miss. Expired entries are
+    /// dropped as a side effect of being looked up.
     pub fn get(&self, method: &str, url: &str) -> Option<HttpResponse> {
         let key = Self::cache_key(method, url);
         if let Some(entry) = self.entries.get(&key) {
@@ -81,6 +109,11 @@ impl InMemoryCache {
         self.entries.get(&key).and_then(|e| e.etag.clone())
     }
 
+    /// Store `response` under `method` and the response's own URL.
+    ///
+    /// Uses the URL from the response rather than a caller-supplied one, so the
+    /// key cannot disagree with the stored data. Does nothing when the resolved
+    /// TTL is zero (`Cache-Control: no-store`/`no-cache`).
     pub fn insert(&self, method: &str, response: HttpResponse) {
         let ttl = self.resolve_ttl(&response);
         if ttl.is_zero() {
@@ -152,10 +185,12 @@ impl InMemoryCache {
         }
     }
 
+    /// Drop the entry for one method and URL.
     pub fn invalidate(&self, method: &str, url: &str) {
         self.entries.remove(&Self::cache_key(method, url));
     }
 
+    /// Drop every entry for `url`, whatever method it was stored under.
     pub fn invalidate_url(&self, url: &str) {
         let suffix = format!(" {url}");
         let keys: Vec<String> = self
@@ -169,14 +204,18 @@ impl InMemoryCache {
         }
     }
 
+    /// Remove everything. The configured policy is untouched.
     pub fn clear(&self) {
         self.entries.clear();
     }
 
+    /// Number of entries currently stored, including any that have expired but
+    /// not yet been looked up.
     pub fn len(&self) -> usize {
         self.entries.len()
     }
 
+    /// True when nothing is stored.
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }

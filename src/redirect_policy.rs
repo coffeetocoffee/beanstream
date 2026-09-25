@@ -43,23 +43,69 @@ fn matches_host_pattern(pattern: &str, host: &str) -> bool {
     pattern == host
 }
 
+/// Rules for which redirect hops are acceptable.
+///
+/// Redirects are a classic SSRF and credential-leak vector: a public URL that a
+/// caller validated can redirect to `169.254.169.254`, and following it blindly
+/// hands the attacker exactly what the first hop's validation was meant to
+/// prevent. BeanStream therefore keeps reqwest on `Policy::none()` and, when
+/// [`Self::follow_redirects`] is set, walks the chain itself — re-validating,
+/// re-pinning and re-checking every hop with [`Self::check_redirect`].
+///
+/// Two rules apply whether or not redirects are followed:
+///
+/// - the chain length is capped at [`Self::max_redirects`], and
+/// - `https` → `http` downgrades are refused across the **whole** chain, so
+///   `https → http → https` cannot launder one.
+///
+/// Start from [`Self::strict`] (explicit allow list) or [`Self::default`] plus
+/// [`Self::allow_host`]. [`Self::relaxed`] permits any host and should be
+/// reserved for trusted configurations.
+///
+/// ```
+/// use beanstream::RedirectPolicy;
+/// use url::Url;
+///
+/// let policy = RedirectPolicy::strict(["example.com", "*.example.com"]);
+///
+/// assert!(policy
+///     .check_redirect(&[], &Url::parse("https://api.example.com/next")?)
+///     .is_ok());
+/// assert!(policy
+///     .check_redirect(&[], &Url::parse("https://evil.com/next")?)
+///     .is_err());
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
 #[derive(Debug, Clone)]
 pub struct RedirectPolicy {
+    /// Maximum hops before [`BeanStreamError::TooManyRedirects`]. Defaults to 10.
     pub max_redirects: usize,
+    /// When `false` together with [`Self::allow_any_redirect`], any host is
+    /// permitted without consulting the lists.
     pub track_all_redirects: bool,
+    /// Hosts a redirect may target. Supports a leading `*.` wildcard for one
+    /// label, so `*.example.com` matches `api.example.com`.
     pub allowed_hosts: HashSet<String>,
+    /// Hosts a redirect may never target. Checked **before** the allow list, so a
+    /// deny entry wins.
     pub denied_hosts: HashSet<String>,
+    /// Allow redirects to hosts not present in [`Self::allowed_hosts`]. Off by
+    /// default: an unknown host is refused.
     pub allow_any_redirect: bool,
     /// Whether `HttpRequest::send` should follow 3xx responses (P1-4).
     ///
     /// Defaults to `false`, so redirects are returned to the caller unless this
-    /// is enabled — matching the previous behaviour. When enabled, every hop is
-    /// checked with [`RedirectPolicy::check_redirect`].
+    /// is enabled. When enabled, every hop is checked with
+    /// [`RedirectPolicy::check_redirect`]. Note that this flag decides only
+    /// whether the chain is walked — the length and scheme rules above are
+    /// enforced either way.
     pub follow_redirects: bool,
     /// Permit a redirect from `https` to plaintext `http` (P1-5).
     ///
     /// Defaults to `false`: once any hop in a chain has used TLS, a later hop
-    /// may not drop back to plaintext.
+    /// may not drop back to plaintext. Only enable this for a destination that
+    /// genuinely cannot serve TLS — it downgrades transport security for the
+    /// rest of the chain.
     pub allow_scheme_downgrade: bool,
 }
 
@@ -78,6 +124,11 @@ impl Default for RedirectPolicy {
 }
 
 impl RedirectPolicy {
+    /// A policy that allows redirects only to `allowed_hosts` (and their
+    /// `*.` subdomains when a wildcard is given).
+    ///
+    /// The safest starting point: an empty allow list means no host is
+    /// acceptable, so every redirect is refused until you name one.
     pub fn strict<I, S>(allowed_hosts: I) -> Self
     where
         I: IntoIterator<Item = S>,
@@ -90,6 +141,11 @@ impl RedirectPolicy {
         policy
     }
 
+    /// A policy that follows redirects to any host, up to `max_redirects`.
+    ///
+    /// **This disables the open-redirect protection**: no destination is
+    /// checked. Use it only when the initial URL is fully trusted, and prefer
+    /// [`Self::strict`] otherwise.
     pub fn relaxed(max_redirects: usize) -> Self {
         Self {
             max_redirects,
@@ -110,19 +166,38 @@ impl RedirectPolicy {
     }
 
     /// Whether the redirect chain should be followed by `HttpRequest::send`.
+    ///
+    /// Setting this does not delegate redirect handling to reqwest; see the type
+    /// documentation for why the chain is walked manually.
     pub fn follow_redirects(mut self, follow: bool) -> Self {
         self.follow_redirects = follow;
         self
     }
 
+    /// Permit redirects to `host`. A `*.example.com` entry also matches
+    /// subdomains; a bare `example.com` matches only that host exactly.
     pub fn allow_host(&mut self, host: &str) {
         self.allowed_hosts.insert(normalize_host(host));
     }
 
+    /// Forbid redirects to `host`, taking precedence over any allow entry.
     pub fn deny_host(&mut self, host: &str) {
         self.denied_hosts.insert(normalize_host(host));
     }
 
+    /// Decide whether one redirect hop is acceptable.
+    ///
+    /// `previous_urls` is the chain walked so far, `next_url` the proposed
+    /// destination. Checks, in order: the chain length against
+    /// [`Self::max_redirects`]; that the scheme is `http`/`https`; the
+    /// `https` → `http` downgrade rule against the *whole* chain; then the deny
+    /// list, and finally the allow list unless
+    /// [`Self::allow_any_redirect`] is set.
+    ///
+    /// Errors are specific — [`BeanStreamError::TooManyRedirects`],
+    /// [`BeanStreamError::RedirectBlocked`] or
+    /// [`BeanStreamError::HostNotAllowed`] — so a caller can tell "chain too
+    /// long" from "destination refused".
     pub fn check_redirect(&self, previous_urls: &[Url], next_url: &Url) -> Result<()> {
         if previous_urls.len() >= self.max_redirects {
             return Err(BeanStreamError::TooManyRedirects(self.max_redirects));
@@ -181,10 +256,14 @@ impl RedirectPolicy {
         Err(BeanStreamError::HostNotAllowed(next_host.to_string()))
     }
 
+    /// The URLs walked so far, rendered as strings. A convenience for logging;
+    /// the links are not sanitized beyond what `Url` already normalized.
     pub fn get_redirect_history(&self, urls: &[Url]) -> Vec<String> {
         urls.iter().map(Url::to_string).collect()
     }
 
+    /// The hosts walked so far, normalized the same way the allow/deny lists
+    /// are, so entries can be compared against them directly.
     pub fn get_redirect_hosts(&self, urls: &[Url]) -> Vec<String> {
         urls.iter()
             .filter_map(Url::host_str)
@@ -193,6 +272,15 @@ impl RedirectPolicy {
     }
 }
 
+/// A host allow/deny list applied to request targets, independent of redirects.
+///
+/// Where [`RedirectPolicy`] governs hops, this screens the destination the
+/// caller asked for. Attach one with
+/// [`HttpRequest::scope_validator`](crate::HttpRequest::scope_validator).
+///
+/// [`Self::new`] takes the default explicitly: `true` refuses any host not
+/// explicitly allowed (a closed client), `false` permits unknown hosts while
+/// still enforcing the deny list. Deny always beats allow.
 #[derive(Debug, Clone)]
 pub struct ScopeValidator {
     allow_list: HashSet<String>,
@@ -201,6 +289,8 @@ pub struct ScopeValidator {
 }
 
 impl ScopeValidator {
+    /// Create a validator. `default_deny` decides what happens to a host in
+    /// neither list.
     pub fn new(default_deny: bool) -> Self {
         Self {
             allow_list: HashSet::new(),
@@ -209,6 +299,7 @@ impl ScopeValidator {
         }
     }
 
+    /// Seed the allow list. Entries may use a leading `*.` wildcard.
     pub fn with_allow_list<I, S>(mut self, hosts: I) -> Self
     where
         I: IntoIterator<Item = S>,
@@ -219,6 +310,7 @@ impl ScopeValidator {
         self
     }
 
+    /// Seed the deny list, which takes precedence over the allow list.
     pub fn with_deny_list<I, S>(mut self, hosts: I) -> Self
     where
         I: IntoIterator<Item = S>,
@@ -252,6 +344,11 @@ impl ScopeValidator {
         self.deny_list.len()
     }
 
+    /// Screen a URL against the lists.
+    ///
+    /// Refuses a non-`http`/`https` scheme before looking at the host — this
+    /// validator does not run the address checks, so call
+    /// [`validate_url`](crate::validate_url) as well; the two are complementary.
     pub fn check_url(&self, url: &str) -> Result<()> {
         let parsed = Url::parse(url)?;
 

@@ -1,3 +1,115 @@
+//! A security-first HTTP client for Rust.
+//!
+//! BeanStream wraps [`reqwest`] and puts a stack of independent validation
+//! layers in front of it, so the security checks happen *before* a socket
+//! exists and again at connect time. The design assumption is that URLs and
+//! headers may come from untrusted input — a user-supplied link, a config file,
+//! a webview message — and that the library, not the caller, is responsible for
+//! refusing the dangerous ones.
+//!
+//! # Overview
+//!
+//! | Layer | What it stops | Entry point |
+//! |-------|---------------|-------------|
+//! | URL & address validation | SSRF: private, loopback, link-local and metadata addresses; embedded credentials; path traversal | [`validate_url`], [`validate_url_async`], [`is_blocked_ip`] |
+//! | Header sanitization | CRLF/header injection, forbidden headers | [`sanitize_header`], [`is_blocked_header`] |
+//! | Response redaction | Token leakage into logs | [`redact_sensitive_headers`], [`HttpResponse::redact`] |
+//! | Redirect policy | Open redirects, `https` → `http` downgrade, credential leakage across origins | [`RedirectPolicy`], [`ScopeValidator`] |
+//! | DNS pinning | DNS-rebinding TOCTOU | [`HttpRequest::send`] resolves once and pins the validated addresses |
+//!
+//! # Quick start
+//!
+//! Validate before you connect. This needs no network access:
+//!
+//! ```
+//! use beanstream::validate_url;
+//!
+//! // Public addresses pass.
+//! let parsed = validate_url("https://8.8.8.8/api")?;
+//! assert_eq!(parsed.port, 443);
+//!
+//! // Private, loopback and reserved ranges are refused, by IP or by name.
+//! assert!(validate_url("http://192.168.1.1/test").is_err());
+//! assert!(validate_url("http://127.0.0.1/api").is_err());
+//! assert!(validate_url("http://localhost/api").is_err());
+//! # Ok::<(), beanstream::BeanStreamError>(())
+//! ```
+//!
+//! Send a request through the fully-pinned path:
+//!
+//! ```no_run
+//! use beanstream::HttpRequest;
+//!
+//! # async fn example() -> Result<(), beanstream::BeanStreamError> {
+//! let response = HttpRequest::get("https://example.com/data")?.send().await?;
+//! println!("{}", response.status);
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! Or configure a shared [`HttpClientBuilder`]. Note that [`HttpClientBuilder::send`]
+//! is the method that applies the validation and pinning layers;
+//! [`HttpClientBuilder::build`] returns a plain [`reqwest::Client`] that trusts
+//! the system resolver, and exists as an escape hatch for callers who have
+//! already validated the destination themselves.
+//!
+//! ```no_run
+//! use std::time::Duration;
+//!
+//! use beanstream::HttpClientBuilder;
+//!
+//! let client = HttpClientBuilder::default()
+//!     .with_base_url("https://api.example.com/v1/")
+//!     .with_timeout(Duration::from_secs(30))
+//!     .with_max_redirects(5)
+//!     .add_default_header("X-Api-Client", "beanstream")?;
+//!
+//! # Ok::<(), beanstream::BeanStreamError>(())
+//! ```
+//!
+//! # Cargo features
+//!
+//! | Feature | Default | What it does |
+//! |---------|---------|--------------|
+//! | `http2` | yes | Enables HTTP/2 via re-exported [`reqwest`] support |
+//! | `rustls-tls` | yes | TLS via `rustls` with webpki roots. **Required for `CertPinConfig`**: without it, building a client with pinning returns [`BeanStreamError::InvalidConfiguration`] rather than silently producing an unpinned client |
+//! | `cookies` | no | Enables `CookieJar` for per-origin session storage. Opt-in, because an always-on jar lets one host's `Set-Cookie` ride along to unrelated later requests |
+//! | `websocket` | no | Enables `connect_websocket` via `tokio-tungstenite` |
+//!
+//! # Security model, stated plainly
+//!
+//! - **Private networks are blocked by default and there is no "localhost is
+//!   fine" exception.** Loopback, link-local, private, shared-address-space,
+//!   benchmarking and multicast ranges are all refused. To reach an internal
+//!   host you must opt in explicitly with
+//!   [`HttpClientBuilder::allow_private_networks`], which is a visible decision
+//!   rather than a default.
+//! - **Only `http` and `https` are accepted.** There is no `data:` or `file:`
+//!   support; a scheme with no host cannot pass the address checks.
+//! - **URLs carrying credentials are refused**, e.g. `https://user:pass@host/`.
+//! - **Redirects are not followed by reqwest.** [`HttpRequest::send`] pins
+//!   reqwest to `Policy::none()` and walks the chain itself, re-validating,
+//!   re-pinning and re-checking every hop. See [`RedirectPolicy`].
+//! - **Redaction is applied to your in-memory [`HttpResponse`]**, not only to
+//!   logs, and again after interceptors run so a token re-injected by an auth
+//!   refresh is still caught. Redaction is destructive: the sensitive entries
+//!   are removed from `headers` and are not recoverable from the response. If
+//!   you need a value like `set-cookie`, read it before it is redacted — for
+//!   example in an [`Interceptor::on_response`] — or configure the request so
+//!   that header is not sensitive to you.
+//!
+//! See `architecture.md` in the repository for the full threat model and
+//! per-module coverage table.
+//!
+//! # Toxicity of `Send`
+//!
+//! Requests and responses are plain data and can be moved across tasks.
+//! [`AbortSignal`] is `Clone` and designed to be shared between the task that
+//! performs the request and the one that cancels it.
+
+#![warn(missing_docs)]
+#![warn(rustdoc::broken_intra_doc_links)]
+
 mod abort;
 mod builder;
 mod cache;

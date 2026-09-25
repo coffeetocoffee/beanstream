@@ -85,33 +85,57 @@ We don't rely on a single security measure. Instead, BeanStream implements multi
 Before any connection attempt, URLs undergo rigorous validation:
 
 ```rust
+/// What `validate_url` returns once every check has passed.
 pub struct ParsedUrl {
-    pub scheme: Scheme,      // Only allow http/https/data
-    pub host: ValidatedHost, // Must be public, never private IP
-    pub port: ValidPort,     // Proper range validation
+    pub scheme: Scheme,      // Http or Https only -- see the note below
+    pub host: ValidatedHost, // Public host; never a private/reserved address
+    pub port: u16,           // Resolved default (80/443) when the URL omits one
     pub path: SanitizedPath, // No dangerous sequences
+    pub original_url: String,
 }
 
-fn validate_url(url: &str) -> Result<ParsedUrl> {
+pub fn validate_url(url: &str) -> Result<ParsedUrl> {
+    // Reject traversal in the raw string BEFORE parsing, because Url::parse
+    // normalizes `/api/../secret` to `/secret` and would hide it (P1-6).
+    validate_raw_url_path(url)?;
+
     let parsed = Url::parse(url)?;
-    
-    // Check scheme
-    ensure_allowed_scheme(&parsed)?;
-    
-    // Block private/internal IPs
-    match parsed.host() {
-        Some(Host::Ipv4(addr)) if is_private_or_loopback(&addr) => {
-            return Err(Error::PrivateNetworkAccess);
-        },
-        Some(Host::Ipv6(addr)) if addr.is_loopback() || addr.is_multicast() => {
-            return Err(Error::InvalidHost);
-        },
-        _ => {},
+
+    // Scheme: only http and https. Anything else (data:, file:, ftp:, ...) is
+    // refused with InvalidScheme.
+    let scheme = Scheme::parse_scheme(parsed.scheme())
+        .ok_or_else(|| BeanStreamError::InvalidScheme(parsed.scheme().to_string()))?;
+
+    // Embedded credentials are refused outright: `https://user:pass@host/`.
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(BeanStreamError::UrlError(
+            "URLs containing credentials are not allowed".to_string(),
+        ));
     }
-    
+
+    // Block private/internal IPs (IPv4 and IPv6, including IPv4-mapped forms).
+    let host = match parsed.host() {
+        Some(url::Host::Domain(domain)) => { /* validate_domain(domain)? */ }
+        Some(url::Host::Ipv4(address)) if is_private_or_loopback(&address) => {
+            return Err(BeanStreamError::PrivateNetworkAccess(address.to_string()));
+        }
+        Some(url::Host::Ipv6(address)) if is_ipv6_loopback_or_multicast(&address) => {
+            return Err(BeanStreamError::PrivateNetworkAccess(address.to_string()));
+        }
+        None => return Err(BeanStreamError::NoHost),
+    };
+
     Ok(ParsedUrl { /* ... */ })
 }
 ```
+
+> **Scheme note (P3-2).** An earlier draft of this document wrote
+> `// Only allow http/https/data` and referenced an `ensure_allowed_scheme`
+> helper. Neither was ever true: `Scheme` has exactly two variants, `Http` and
+> `Https`, and `data:` is refused along with every other scheme. There is no
+> `data:` support, and no plan to add it — a `data:` URL has no host to validate,
+> so it cannot pass the address checks this layer is built around. The sketch
+> above now matches the implementation.
 
 This catches AWS/GCP metadata exploits, internal service access attempts, and DNS rebinding attacks before they ever reach the network stack.
 
@@ -562,6 +586,10 @@ cargo llvm-cov --all-features --workspace --summary-only
 cargo llvm-cov report --fail-under-lines 80   # what CI enforces
 ```
 
+The document's other examples are executable too: `cargo test --doc` runs 15
+doctests drawn from this crate's rustdoc, on every feature combination
+(`cargo test --doc`, `--all-features`, `--no-default-features`).
+
 The low rows are honest and explain themselves. `error_handling_impl.rs` is
 almost entirely `#[derive(Error)]` and `From` impls whose generated code has no
 branches to exercise. `abort.rs` and `streaming.rs` are dominated by the
@@ -698,13 +726,13 @@ tracked work, not marketing.
 
 | Item | State | Evidence |
 |------|-------|----------|
-| All tests passing | ✅ | 109 unit + 9 API-path + 5 behaviour tests on default features; 114 + 9 + 6 with `--all-features`. Enforced by CI. |
+| All tests passing | ✅ | 109 unit + 9 API-path + 5 behaviour + 15 doctests on default features; 114 + 9 + 6 + 15 with `--all-features`. Enforced by CI. |
 | Coverage measured and floored | ✅ | 85.3% lines, CI fails under 80% (see [Measured Coverage](#measured-coverage)). |
 | Documented import paths compile | ✅ | `tests/documented_api_paths.rs` imports the crate exactly as README.md shows, so a private-module path breaks the build (P2-7). |
-| Security audit completed | ✅ | `BeanStream_weaknesses.txt`; P0, P1 and P2-1..P2-4 closed. |
-| Lints and formatting enforced | ✅ | CI runs `cargo fmt --check` and `cargo clippy --all-targets -- -D warnings` on default *and* all features. |
-| Docs build warning-free | ✅ | CI runs `cargo doc --no-deps --all-features` with `RUSTDOCFLAGS=-D warnings`. |
-| Public API documented (rustdoc) | ⬜ | Module-level and item docs exist, but the public API is not yet documented to the standard the README promises (P3-3). |
+| Public API documented (rustdoc) | ✅ | `#![warn(missing_docs)]` on the crate root; 169 previously undocumented public items now have docs, and 15 doctests exercise the examples (P3-3). CI fails on any missing doc. |
+| Security audit completed | ✅ | `BeanStream_weaknesses.txt`; P0, P1, P2 and P3 all closed. |
+| Lints and formatting enforced | ✅ | CI runs `cargo fmt --check` and `cargo clippy --all-targets -- -D warnings` on default, all and no-default features. |
+| Docs build warning-free | ✅ | CI runs `cargo doc --no-deps --all-features` with `RUSTDOCFLAGS=-D warnings`, plus `cargo test --doc`. Verified clean on default, all and no-default features. |
 | Performance benchmarks within targets | ⬜ | No benchmark suite and no measured targets yet. |
 | Dependency licenses reviewed | ⬜ | Licenses are declared in `Cargo.toml`; no automated `cargo-deny` / `cargo-license` gate yet. |
 | TypeScript definitions generated | ⬜ | There is no JS/TS bridge. The npm channel below is a plan, not an artifact. |

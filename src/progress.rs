@@ -1,9 +1,31 @@
 use std::sync::Arc;
 
-/// Real-time progress tracking for uploads/downloads.
-/// Returning `false` from `on_progress` signals cancellation.
-/// Mirrors architecture.md:238-240 and 422.
+/// Real-time progress tracking for uploads and downloads.
+///
+/// Attach with [`HttpRequest::with_progress`](crate::HttpRequest::with_progress).
+/// The callback is invoked as the transfer proceeds, and its return value
+/// controls whether to continue: returning `false` **cancels the request** and
+/// surfaces [`BeanStreamError::RequestAborted`](crate::BeanStreamError::RequestAborted),
+/// so it doubles as a cooperative cancellation hook.
+///
+/// Implemented automatically for any `Fn(u64, Option<u64>) -> bool` that is
+/// `Send + Sync + 'static`, so a closure is usually enough:
+///
+/// ```no_run
+/// use beanstream::HttpRequest;
+///
+/// # fn example() -> Result<(), beanstream::BeanStreamError> {
+/// let request = HttpRequest::get("https://example.com/big-file")?
+///     .with_progress(|transferred: u64, total: Option<u64>| {
+///         println!("{transferred} / {total:?}");
+///         true // return false to cancel
+///     });
+/// # Ok(())
+/// # }
+/// ```
 pub trait UploadProgress: Send + Sync + 'static {
+    /// Called with the number of bytes transferred so far and the total when
+    /// known. Return `false` to abort the request.
     fn on_progress(&self, uploaded: u64, total: Option<u64>) -> bool;
 }
 
@@ -16,6 +38,8 @@ where
     }
 }
 
+/// A tracker that does nothing and never cancels. Useful when a `Progress`
+/// value is required but no reporting is wanted.
 #[derive(Clone)]
 pub struct NoopProgress;
 impl UploadProgress for NoopProgress {

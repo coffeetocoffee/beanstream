@@ -21,26 +21,42 @@ use crate::{BeanStreamError, Result};
 
 /// Response returned by [`HttpRequest::send`].
 ///
-/// `headers` are redacted: sensitive entries (`set-cookie`, `authorization`,
-/// ...) are stripped before the response is handed to the caller (P1-3).
+/// [`Self::headers`] are **redacted**: sensitive entries (`set-cookie`,
+/// `authorization`, `x-api-key`, …) are stripped before the response reaches the
+/// caller (P1-3), and again after interceptors run. Redaction is destructive —
+/// the removed values are not recoverable from this struct. If you need one,
+/// read it in an [`Interceptor::on_response`](crate::Interceptor::on_response)
+/// before that second pass.
 #[derive(Debug, Clone)]
 pub struct HttpResponse {
+    /// HTTP status code.
     pub status: u16,
+    /// Response headers, with sensitive names removed. Names are lowercase.
     pub headers: Vec<(String, String)>,
+    /// The response body. Held in full, so a large download is best streamed
+    /// with [`download_stream`](crate::download_stream) instead.
     pub body: Vec<u8>,
+    /// The URL that actually produced this response. After a followed redirect
+    /// chain this is the final URL, not the one requested.
     pub url: String,
 }
 
 impl HttpResponse {
+    /// Decode the body as UTF-8.
+    ///
+    /// Returns [`BeanStreamError::InternalError`] if the body is not valid
+    /// UTF-8 — use [`Self::bytes`] for binary payloads.
     pub fn text(&self) -> Result<String> {
         String::from_utf8(self.body.clone())
             .map_err(|e| BeanStreamError::InternalError(e.to_string()))
     }
 
+    /// The raw body, without decoding.
     pub fn bytes(&self) -> &[u8] {
         &self.body
     }
 
+    /// Whether the status is in the 2xx range.
     pub fn is_success(&self) -> bool {
         (200..300).contains(&self.status)
     }
@@ -66,21 +82,62 @@ struct RedirectHop {
     body: Option<String>,
 }
 
+/// A single HTTP request, already validated, ready to send.
+///
+/// Build one with [`Self::new`] or a verb helper ([`Self::get`], [`Self::post`],
+/// …), which validate the URL up front — so an invalid target fails at
+/// construction, not at send time. Chain the ownership-taking `body`, `timeout`
+/// and `redirect_policy` methods to configure it, then either attach optional
+/// features ([`Self::with_retry`], [`Self::with_cache`], [`Self::with_progress`],
+/// [`Self::with_signal`]) or call [`Self::send`].
+///
+/// ```no_run
+/// use std::time::Duration;
+///
+/// use beanstream::HttpRequest;
+///
+/// # fn example() -> Result<(), beanstream::BeanStreamError> {
+/// let mut request = HttpRequest::post("https://api.example.com/items")?
+///     .body(r#"{"name":"espresso"}"#)
+///     .timeout(Duration::from_secs(10));
+/// request.add_header("Content-Type", "application/json")?;
+/// # Ok(())
+/// # }
+/// ```
+///
+/// [`Self::send`] is where the security layers apply: it resolves the host once,
+/// validates every resolved address, pins them into the client so reqwest cannot
+/// re-resolve, and walks redirects itself when the policy asks for it.
 pub struct HttpRequest {
+    /// The HTTP method.
     pub method: Method,
+    /// The target URL, after `HttpRequest::new` normalized it against any base.
     pub url: String,
+    /// The parsed and validated form of [`Self::url`].
     pub parsed_url: ParsedUrl,
+    /// Headers to send. Added through [`Self::add_header`], which sanitizes.
     pub headers: Vec<(String, String)>,
+    /// Optional request body.
     pub body: Option<String>,
+    /// Overall timeout for the exchange. Defaults to 30 seconds.
     pub timeout: Duration,
+    /// Redirect rules. Defaults to refusing every redirect, so a 3xx is returned
+    /// to the caller.
     pub redirect_policy: RedirectPolicy,
+    /// Host allow/deny list for the target itself.
     pub scope_validator: ScopeValidator,
+    /// Cancellation handle, if one was attached with [`Self::with_signal`].
     pub abort_signal: Option<AbortSignal>,
+    /// Retry policy, if attached with [`Self::with_retry`].
     pub retry: Option<RetryConfig>,
+    /// Response cache, if attached with [`Self::with_cache`].
     pub cache: Option<Arc<InMemoryCache>>,
+    /// Concurrency limiter, if attached with [`Self::with_rate_limiter`].
     pub rate_limiter: Option<RateLimiter>,
+    /// Middleware chain, run before the request and after the response.
     pub interceptors: InterceptorChain,
     /// Shared cookie jar, only meaningful with the `cookies` feature (P2-2).
+    /// Opt-in: an implicit jar would let one host's cookies reach another.
     #[cfg(feature = "cookies")]
     pub cookie_jar: Option<crate::cookies::CookieJar>,
     progress: Option<Arc<dyn UploadProgress>>,
@@ -131,26 +188,37 @@ impl Clone for HttpRequest {
 }
 
 impl HttpRequest {
+    /// A `GET` request. Validates `url` immediately.
     pub fn get(url: &str) -> Result<Self> {
         Self::new(Method::GET, url)
     }
 
+    /// A `POST` request. Validates `url` immediately.
     pub fn post(url: &str) -> Result<Self> {
         Self::new(Method::POST, url)
     }
 
+    /// A `PUT` request. Validates `url` immediately.
     pub fn put(url: &str) -> Result<Self> {
         Self::new(Method::PUT, url)
     }
 
+    /// A `DELETE` request. Validates `url` immediately.
     pub fn delete(url: &str) -> Result<Self> {
         Self::new(Method::DELETE, url)
     }
 
+    /// A `PATCH` request. Validates `url` immediately.
     pub fn patch(url: &str) -> Result<Self> {
         Self::new(Method::PATCH, url)
     }
 
+    /// Build a request for an arbitrary method.
+    ///
+    /// Validates the URL via [`validate_url`] before returning, so a private,
+    /// credential-bearing or non-`http(s)` target is rejected here rather than
+    /// at send time. The default scope validator is host-scoped to this URL's
+    /// host, and the request defaults to a 30-second timeout.
     pub fn new(method: Method, url: &str) -> Result<Self> {
         let parsed_url = validate_url(url)?;
         let mut scope_validator = ScopeValidator::new(true);
@@ -176,6 +244,16 @@ impl HttpRequest {
         })
     }
 
+    /// Add one header.
+    ///
+    /// Takes `&mut self` rather than consuming, so a failure names the offending
+    /// header while leaving the request usable. The header is sanitized for CRLF
+    /// injection and checked against the forbidden list (`Host`,
+    /// `Content-Length`, `Transfer-Encoding`, …).
+    ///
+    /// Note the ergonomics: because this borrows mutably, call it *after* the
+    /// consuming methods like [`Self::body`] and [`Self::timeout`], or chain it
+    /// as a statement rather than in the middle of a builder chain.
     pub fn add_header(&mut self, name: &str, value: &str) -> Result<&mut Self> {
         let (name, value) = sanitize_header(name, value)?;
 
@@ -189,6 +267,11 @@ impl HttpRequest {
         Ok(self)
     }
 
+    /// Add many headers at once, stopping at the first rejection.
+    ///
+    /// Accepts any iterator of pairs whose elements are string-like, so arrays,
+    /// `Vec`s and maps all work. See [`Self::add_header`] for the borrow
+    /// semantics.
     pub fn add_headers<I, K, V>(&mut self, headers: I) -> Result<&mut Self>
     where
         I: IntoIterator<Item = (K, V)>,
@@ -201,39 +284,51 @@ impl HttpRequest {
         Ok(self)
     }
 
+    /// Set the request body. Consumes and returns `Self`, so it cannot fail —
+    /// the body is sent as given, not validated.
     pub fn body(mut self, body: impl Into<String>) -> Self {
         self.body = Some(body.into());
         self
     }
 
+    /// Override the overall timeout, which defaults to 30 seconds.
     pub fn timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
         self
     }
 
+    /// Use a specific redirect policy instead of the default (which refuses
+    /// every redirect).
     pub fn redirect_policy(mut self, redirect_policy: RedirectPolicy) -> Self {
         self.redirect_policy = redirect_policy;
         self
     }
 
+    /// Replace the scope validator. The default one is host-scoped to this
+    /// request's own host, so it permits only that host.
     pub fn scope_validator(mut self, scope_validator: ScopeValidator) -> Self {
         self.scope_validator = scope_validator;
         self
     }
 
-    /// Attach an abort signal (P0-2). If aborted, `send().await` returns `RequestAborted`.
+    /// Attach an abort signal (P0-2). If already aborted, or aborted while in
+    /// flight, `send().await` returns [`BeanStreamError::RequestAborted`](crate::BeanStreamError::RequestAborted).
     pub fn with_signal(mut self, signal: AbortSignal) -> Self {
         self.abort_signal = Some(signal);
         self
     }
 
-    /// Alias for `with_signal` to match `execute_with_abort` naming.
+    /// Alias for [`Self::with_signal`], matching the
+    /// [`execute_with_abort`](crate::execute_with_abort) naming.
     pub fn abort_signal(mut self, signal: AbortSignal) -> Self {
         self.abort_signal = Some(signal);
         self
     }
 
-    /// Attach progress tracker (P0-3).
+    /// Attach a progress tracker (P0-3), called as the body is written.
+    ///
+    /// The tracker is boxed, so it needs to be `'static`; use
+    /// [`Self::with_progress_arc`] to attach one already shared behind an `Arc`.
     pub fn with_progress<P>(mut self, progress: P) -> Self
     where
         P: UploadProgress,
@@ -242,25 +337,36 @@ impl HttpRequest {
         self
     }
 
-    /// Attach already-boxed progress trait object.
+    /// Attach an already-shared progress tracker (P0-3).
     pub fn with_progress_arc(mut self, progress: Arc<dyn UploadProgress>) -> Self {
         self.progress = Some(progress);
         self
     }
 
-    /// Attach automatic retry configuration (P0-4).
+    /// Attach automatic retry with backoff (P0-4).
+    ///
+    /// The DNS pin is computed once, before the retry loop, so every attempt
+    /// connects to the same validated addresses rather than re-resolving.
     pub fn with_retry(mut self, retry: RetryConfig) -> Self {
         self.retry = Some(retry);
         self
     }
 
     /// Attach an intelligent response cache (P0-5).
+    ///
+    /// Passed as an `Arc` so several requests share one cache. Cached responses
+    /// are the redacted ones, so a hit cannot leak what a fresh response would
+    /// have stripped.
     pub fn with_cache(mut self, cache: Arc<InMemoryCache>) -> Self {
         self.cache = Some(cache);
         self
     }
 
     /// Attach a semaphore-based rate limiter (P0-6).
+    ///
+    /// Caps in-flight requests and optionally enforces a minimum interval
+    /// between them. The limiter is consumed, so share one by cloning the
+    /// [`RateLimiter`] before attaching.
     pub fn with_rate_limiter(mut self, rate_limiter: RateLimiter) -> Self {
         self.rate_limiter = Some(rate_limiter);
         self
@@ -276,12 +382,18 @@ impl HttpRequest {
         self
     }
 
-    /// Replace the whole interceptor chain (P0-7).
+    /// Replace the whole interceptor chain (P0-7), discarding any already
+    /// registered.
     pub fn with_interceptors(mut self, chain: InterceptorChain) -> Self {
         self.interceptors = chain;
         self
     }
 
+    /// Re-check the request's scope and headers without sending it.
+    ///
+    /// Useful as a pre-flight check, and as a way to confirm a modified request
+    /// is still acceptable. [`Self::send`] performs these checks itself, so
+    /// calling this first is optional.
     pub fn validate(&self) -> Result<()> {
         self.scope_validator.check_url(&self.url)?;
         validate_headers(&self.headers)
@@ -458,6 +570,13 @@ impl HttpRequest {
             })
     }
 
+    /// Build a plain [`reqwest::Request`] from this request, without sending it.
+    ///
+    /// Validates first (scope and headers), then constructs the request against
+    /// a client built with no pinned addresses — so the
+    /// returned request carries the transport settings but **no SSRF pinning**.
+    /// Exists for callers who need to hand the request to their own reqwest
+    /// client; prefer [`Self::send`], which pins the validated addresses.
     pub fn build_request(&self) -> Result<reqwest::Request> {
         self.validate()?;
 
@@ -751,6 +870,36 @@ impl HttpRequest {
     /// The hostname is resolved asynchronously and pinned to the validated
     /// addresses before connecting (P1-1), and response headers are redacted
     /// before they are returned (P1-3).
+    ///
+    /// This is where every security layer is applied, and the order matters:
+    ///
+    /// 1. Interceptors run `on_request`, so middleware can modify the request
+    ///    before validation.
+    /// 2. The scope validator and header checks run on the *final* request.
+    /// 3. An already-fired abort signal short-circuits without connecting.
+    /// 4. Rate-limit permit is acquired, then the cache is consulted for `GET`
+    ///    and `HEAD`.
+    /// 5. The host is resolved once and every address validated; the validated
+    ///    list is pinned into the client, so reqwest performs no second lookup.
+    ///    The pin is computed *before* the retry loop, so retries cannot
+    ///    re-resolve to a different address.
+    /// 6. Redirects, if the policy enables following, are walked here rather
+    ///    than by reqwest — each hop re-validated and re-pinned.
+    /// 7. Response headers are redacted, interceptors run `on_response`, and
+    ///    redaction is applied again so an interceptor cannot re-introduce a
+    ///    secret.
+    ///
+    /// ```no_run
+    /// use beanstream::HttpRequest;
+    ///
+    /// # async fn example() -> Result<(), beanstream::BeanStreamError> {
+    /// let response = HttpRequest::get("https://example.com/")?.send().await?;
+    /// if response.is_success() {
+    ///     println!("{}", response.text()?);
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn send(&self) -> Result<HttpResponse> {
         let interceptors = self.interceptors.clone();
         let mut this = self.clone();

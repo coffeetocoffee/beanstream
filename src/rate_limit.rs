@@ -7,7 +7,28 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use crate::BeanStreamError;
 
 /// Semaphore-based rate limiter controlling concurrent in-flight requests.
-/// Mirrors architecture.md:70, 356, 387, 423.
+///
+/// Mirrors architecture.md:70, 356, 387, 423. Two independent limits can be
+/// combined: a cap on how many requests run at once, and a minimum spacing
+/// between request starts.
+///
+/// Cloning is cheap and shares state, which is how one limiter governs several
+/// requests — clone it before attaching, since
+/// [`HttpRequest::with_rate_limiter`](crate::HttpRequest::with_rate_limiter)
+/// consumes the value.
+///
+/// ```no_run
+/// use std::time::Duration;
+///
+/// use beanstream::{HttpRequest, RateLimiter};
+///
+/// # fn example() -> Result<(), beanstream::BeanStreamError> {
+/// let limiter = RateLimiter::new(4).with_min_interval(Duration::from_millis(100));
+/// let first = HttpRequest::get("https://8.8.8.8/")?.with_rate_limiter(limiter.clone());
+/// let second = HttpRequest::get("https://1.1.1.1/")?.with_rate_limiter(limiter);
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Debug, Clone)]
 pub struct RateLimiter {
     semaphore: Arc<Semaphore>,
@@ -17,6 +38,9 @@ pub struct RateLimiter {
 
 impl RateLimiter {
     /// Limit the number of simultaneously in-flight requests.
+    ///
+    /// Zero is treated as one, since a limiter that permits nothing could never
+    /// make progress.
     pub fn new(max_concurrent: usize) -> Self {
         let permits = NonZeroUsize::new(max_concurrent.max(1)).expect("at least one permit");
         Self {
@@ -27,17 +51,28 @@ impl RateLimiter {
     }
 
     /// Additionally enforce a minimum spacing between request starts.
+    ///
+    /// Unlike the concurrency cap this is a throughput limit: the next start
+    /// waits until the interval has elapsed since the previous one.
     pub fn with_min_interval(mut self, interval: Duration) -> Self {
         self.min_interval = Some(interval);
         self
     }
 
+    /// Permits currently available. Note this is the number *free right now*,
+    /// not the configured maximum — compare with
+    /// [`HttpRequest::rate_limiter`](crate::HttpRequest::rate_limiter) config or
+    /// track the maximum yourself if you need it.
     pub fn max_concurrent(&self) -> usize {
         self.semaphore.available_permits()
     }
 
     /// Acquire a permit, waiting for a free slot and honoring the minimum
     /// interval. Returns a guard that releases the slot when dropped.
+    ///
+    /// Because the guard is released on drop, hold it for as long as the
+    /// request should count against the limit — for the whole request lifecycle,
+    /// as [`HttpRequest::send`](crate::HttpRequest::send) does.
     pub async fn acquire(&self) -> Result<RateLimitGuard, BeanStreamError> {
         let permit = self
             .semaphore
@@ -61,6 +96,10 @@ impl RateLimiter {
     }
 
     /// Try to acquire without waiting.
+    ///
+    /// Returns [`BeanStreamError::RateLimited`] immediately when no slot is
+    /// free. Note that this does **not** apply [`Self::with_min_interval`]: a
+    /// caller that wants the spacing must use [`Self::acquire`], which waits.
     pub fn try_acquire(&self) -> Result<RateLimitGuard, BeanStreamError> {
         let permit = self
             .semaphore
@@ -71,6 +110,10 @@ impl RateLimiter {
     }
 }
 
+/// Holds a rate-limit slot for as long as it is alive.
+///
+/// Dropping the guard frees the slot, so keeping it in scope for the duration of
+/// the work is what makes the limit meaningful.
 #[derive(Debug)]
 pub struct RateLimitGuard {
     _permit: OwnedSemaphorePermit,

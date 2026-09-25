@@ -271,6 +271,38 @@ BeanStream rides on `reqwest` with `rustls`, so it compiles and runs cleanly on:
 
 ---
 
+## Documentation
+
+The API is documented with rustdoc, and the crate root is the place to start:
+
+```bash
+cargo doc --open
+```
+
+What's covered:
+
+- **Crate overview** — the security model stated plainly: private networks are
+  blocked with no loopback exception, only `http`/`https` are accepted, URLs
+  with embedded credentials are refused, reqwest never follows redirects on its
+  own, and redaction is destructive.
+- **Every public item** — the builder methods, the `HttpRequest` pipeline, the
+  `BeanStreamError` variants (including which failures are retryable and which
+  are permanent), `RedirectPolicy`, `ScopeValidator`, `RetryConfig`, the cache,
+  the rate limiter, `CertPinConfig`, and the feature-gated `CookieJar` and
+  WebSocket support.
+- **The `send()` pipeline order** — why interceptors run before validation, and
+  why redaction is applied twice.
+
+`#![warn(missing_docs)]` is enabled, so a new public item without documentation
+is a warning rather than an oversight, and `cargo doc` runs in CI with
+`RUSTDOCFLAGS=-D warnings`.
+
+There are also 15 doctests, run on default, `--all-features` and
+`--no-default-features`, so the examples in the docs are executed rather than
+merely written.
+
+---
+
 ## Contributing
 
 Want to help brew something great? Contributions are welcome and appreciated.

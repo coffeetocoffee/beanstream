@@ -9,10 +9,20 @@ use crate::{BeanStreamError, Result};
 
 /// Domain-specific ATS exception (e.g. allow a partner domain that still
 /// needs relaxed TLS or cleartext).
+///
+/// Both flags default to the *relaxing* direction when you construct this
+/// struct literally — set them deliberately. Each one widens what iOS will
+/// permit for [`Self::domain`] only.
 #[derive(Debug, Clone)]
 pub struct AtsException {
+    /// The domain this exception applies to, e.g. `api.partner.example`.
     pub domain: String,
+    /// Allow arbitrary (non-TLS) loads for this domain by setting
+    /// `NSExceptionAllowsInsecureHTTPLoads`. Weakens transport security; use
+    /// only where TLS cannot be served.
     pub allows_arbitrary_loads: bool,
+    /// Allow TLS versions and ciphers below ATS's floor for this domain by
+    /// setting `NSExceptionMinimumTLSVersion`. Needed for legacy endpoints.
     pub allows_insecure_httptls: bool,
 }
 

@@ -23,17 +23,45 @@ use crate::{BeanStreamError, Result};
 
 /// A set of SPKI SHA-256 pins. A connection is allowed only if the
 /// end-entity certificate matches at least one pin.
+///
+/// Pinning narrows trust from "any certificate the root store accepts" to "only
+/// this key". It is the defence against a compromised or coerced CA, so a pin
+/// mismatch is a security event, not a transient error — it surfaces as
+/// [`BeanStreamError::CertificatePinningFailed`].
+///
+/// Configure with [`HttpClientBuilder::with_cert_pinning`](crate::HttpClientBuilder::with_cert_pinning),
+/// which requires the `rustls-tls` feature. The hash is over the certificate's
+/// **Subject Public Key Info**, not the whole certificate, so a certificate
+/// renewal that keeps the same key does not invalidate the pin.
+///
+/// ```no_run
+/// use beanstream::CertPinConfig;
+///
+/// // From a base64 SPKI hash, as usually published for HPKP-style pinning.
+/// let config = CertPinConfig::new()
+///     .pin_spki_sha256_base64("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")?;
+/// # Ok::<(), beanstream::BeanStreamError>(())
+/// ```
 #[derive(Debug, Clone, Default)]
 pub struct CertPinConfig {
     pins: Vec<[u8; 32]>,
 }
 
 impl CertPinConfig {
+    /// An empty pin set. It must be given at least one pin before it can build a
+    /// TLS config — building with none is
+    /// [`BeanStreamError::InvalidConfiguration`], since a client that pins
+    /// nothing is indistinguishable from one that pins everything.
     pub fn new() -> Self {
         Self::default()
     }
 
     /// Add a pin given as base64-encoded SPKI SHA-256 (no `sha256/` prefix).
+    ///
+    /// A leading `sha256/` is tolerated and stripped, so pins copied verbatim
+    /// from an HPKP header work. The decoded value must be exactly 32 bytes;
+    /// anything else is [`BeanStreamError::InvalidConfiguration`]. Returns `Self`
+    /// so several pins can be chained.
     pub fn pin_spki_sha256_base64(mut self, pin: &str) -> Result<Self> {
         let decoded = BASE64
             .decode(pin.trim().trim_start_matches("sha256/"))
@@ -55,6 +83,8 @@ impl CertPinConfig {
         self
     }
 
+    /// Whether no pins have been added. A config that is empty cannot build a
+    /// TLS config.
     pub fn is_empty(&self) -> bool {
         self.pins.is_empty()
     }

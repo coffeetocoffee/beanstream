@@ -34,23 +34,34 @@ impl std::fmt::Debug for InterceptorChain {
 }
 
 impl InterceptorChain {
+    /// An empty chain. Adding nothing is the default, so this is equivalent to
+    /// [`Self::default`].
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Append an interceptor. Order is preserved: interceptors run in the order
+    /// added, for both requests and responses.
     pub fn add(&mut self, interceptor: Arc<dyn Interceptor>) -> &mut Self {
         self.interceptors.push(interceptor);
         self
     }
 
+    /// How many interceptors are registered.
     pub fn len(&self) -> usize {
         self.interceptors.len()
     }
 
+    /// Whether no interceptors are registered.
     pub fn is_empty(&self) -> bool {
         self.interceptors.is_empty()
     }
 
+    /// Run every interceptor's request hook, stopping at the first error.
+    ///
+    /// Called by [`HttpRequest::send`](crate::HttpRequest::send) **before**
+    /// validation, so an interceptor can still mutate the request — and the
+    /// mutations are then validated like anything else.
     pub fn run_on_request(&self, req: &mut HttpRequest) -> Result<()> {
         for interceptor in &self.interceptors {
             interceptor.on_request(req)?;
@@ -58,6 +69,11 @@ impl InterceptorChain {
         Ok(())
     }
 
+    /// Run every interceptor's response hook, stopping at the first error.
+    ///
+    /// Called after the response has been redacted. Redaction is applied again
+    /// afterwards, so an interceptor that injects a credential cannot leave it
+    /// in the response the caller receives.
     pub fn run_on_response(&self, resp: &mut HttpResponse) -> Result<()> {
         for interceptor in &self.interceptors {
             interceptor.on_response(resp)?;
@@ -90,6 +106,10 @@ pub struct AuthInterceptor {
 }
 
 impl AuthInterceptor {
+    /// Attach `Authorization: Bearer <token>` to outgoing requests.
+    ///
+    /// The token is stored as given. Any previous value for the same header is
+    /// replaced, so a retry does not send the header twice.
     pub fn new(token: impl Into<String>) -> Self {
         Self {
             token: token.into(),

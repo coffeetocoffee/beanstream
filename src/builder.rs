@@ -11,6 +11,37 @@ use crate::redirect_policy::{RedirectPolicy, ScopeValidator};
 use crate::request_handler::{HttpRequest, HttpResponse};
 use crate::{BeanStreamError, Result};
 
+/// Configure a client once and reuse the settings for many requests.
+///
+/// Defaults: 30-second request timeout, 10-second connect timeout, 10 redirect
+/// hops, redirects **not** followed, user agent `BeanStream/1.0`, private
+/// networks blocked, no pinning, no interceptors.
+///
+/// There are two exits, and the difference matters:
+///
+/// - [`Self::create_request`] and [`Self::send`] produce requests that go
+///   through the full validation and DNS-pinning pipeline. **Prefer these.**
+/// - [`Self::build`] returns a bare [`reqwest::Client`] with the same transport
+///   settings but normal DNS resolution, so it does not pin and cannot enforce
+///   SSRF protection. It exists for destinations the caller has already
+///   validated.
+///
+/// ```
+/// use std::time::Duration;
+///
+/// use beanstream::HttpClientBuilder;
+///
+/// let builder = HttpClientBuilder::default()
+///     .with_base_url("https://api.example.com/v1/")
+///     .with_timeout(Duration::from_secs(15))
+///     .with_follow_redirects(true)
+///     .add_default_header("Accept", "application/json")?;
+///
+/// // Requests created here inherit the timeout, headers and policies.
+/// let request = builder.create_request(reqwest::Method::GET, "users")?;
+/// assert_eq!(request.url, "https://api.example.com/v1/users");
+/// # Ok::<(), beanstream::BeanStreamError>(())
+/// ```
 #[derive(Debug, Clone)]
 pub struct HttpClientBuilder {
     base_url: Option<String>,
@@ -47,36 +78,61 @@ impl Default for HttpClientBuilder {
 }
 
 impl HttpClientBuilder {
+    /// Set the base URL used to resolve relative targets passed to
+    /// [`Self::create_request`] or [`Self::send`].
+    ///
+    /// Also seeds the redirect policy's allow list with this host, so a
+    /// configured client can legitimately redirect within its own host.
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
         self.base_url = Some(base_url.into());
         self
     }
 
+    /// Overall request timeout, covering the whole exchange rather than just
+    /// connection setup. Defaults to 30 seconds.
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
         self
     }
 
+    /// Maximum redirect hops before [`BeanStreamError::TooManyRedirects`].
+    /// Defaults to 10.
     pub fn with_max_redirects(mut self, max_redirects: usize) -> Self {
         self.max_redirects = max_redirects;
         self
     }
 
+    /// Whether [`HttpRequest::send`](crate::HttpRequest::send) walks redirect
+    /// chains. Defaults to `false`, which returns the 3xx response to the caller.
+    ///
+    /// Setting this `true` does not hand redirect-following to reqwest —
+    /// BeanStream always pins reqwest to `Policy::none()` and walks the chain
+    /// itself, re-validating and re-pinning each hop. This flag only decides
+    /// whether that walking happens.
     pub fn with_follow_redirects(mut self, follow_redirects: bool) -> Self {
         self.follow_redirects = follow_redirects;
         self
     }
 
+    /// Connection-establishment timeout, separate from [`Self::with_timeout`].
+    /// Defaults to 10 seconds.
     pub fn with_connect_timeout(mut self, connect_timeout: Duration) -> Self {
         self.connect_timeout = connect_timeout;
         self
     }
 
+    /// User agent for every request. Defaults to `BeanStream/1.0`. Rejected at
+    /// build time if it is not a valid header value.
     pub fn with_user_agent(mut self, user_agent: impl Into<String>) -> Self {
         self.user_agent = user_agent.into();
         self
     }
 
+    /// Add a header sent with every request from this client.
+    ///
+    /// The header is sanitized immediately, so this returns an error for CRLF
+    /// injection or a forbidden header name rather than failing later at send
+    /// time. Call repeatedly to add several.
     pub fn add_default_header(
         mut self,
         name: impl AsRef<str>,
@@ -118,17 +174,23 @@ impl HttpClientBuilder {
     /// Require every TLS connection to match one of the configured SPKI
     /// SHA-256 pins (P0-9).
     ///
-    /// Pinning is enforced by installing a preconfigured rustls client, so it
-    /// needs the `rustls-tls` feature. Without it, setting a pin is silently
-    /// inert — better to fail at request time than to look pinned while
-    /// trusting any certificate.
+    /// Pinning is installed as a preconfigured rustls client, so it requires the
+    /// `rustls-tls` feature. Without that feature, [`Self::build`] and the
+    /// pinned send path return [`BeanStreamError::InvalidConfiguration`] rather
+    /// than producing a client that merely looks pinned — a pin that is
+    /// silently ignored is worse than a clear failure.
     pub fn with_cert_pinning(mut self, config: CertPinConfig) -> Self {
         self.cert_pinning = Some(config);
         self
     }
 
-    /// Register a middleware interceptor on every request created by this
-    /// builder (P0-7).
+    /// Register middleware applied to every request created by this builder
+    /// (P0-7).
+    ///
+    /// The chain runs in the order interceptors were added. `on_request` runs
+    /// before the request is built, `on_response` after it returns and after
+    /// redaction — and redaction is re-applied afterwards, so an interceptor
+    /// that injects an auth token cannot leak it into the response.
     pub fn add_interceptor(
         mut self,
         interceptor: std::sync::Arc<dyn crate::interceptor::Interceptor>,
