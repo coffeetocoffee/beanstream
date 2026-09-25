@@ -97,6 +97,22 @@
 //!   you need a value like `set-cookie`, read it before it is redacted — for
 //!   example in an [`Interceptor::on_response`] — or configure the request so
 //!   that header is not sensitive to you.
+//! - **Every send path pins addresses**, not just the main one:
+//!   [`HttpRequest::send`], [`HttpClientBuilder::send`],
+//!   [`download_stream`] and `connect_websocket` all resolve once, validate
+//!   every address, and connect to a validated address only.
+//! - **A rejected header cannot be reintroduced.** `HttpRequest::validate`
+//!   re-checks the forbidden list (`Host`, `Content-Length`, …) on the final
+//!   header set, so neither a direct push onto the public `headers` field nor
+//!   an interceptor can smuggle one past the guard that
+//!   [`HttpRequest::add_header`] applies.
+//!
+//! # What is not implemented
+//!
+//! Stated here rather than left to be discovered: there is **no proxy
+//! support** (no `Proxy` type, no environment-variable handling), no benchmark
+//! suite, and no JavaScript/TypeScript bridge. [`CertPinConfig`] applies to
+//! HTTP and to [`download_stream`], but **not** to the WebSocket TLS handshake.
 //!
 //! See `architecture.md` in the repository for the full threat model and
 //! per-module coverage table.

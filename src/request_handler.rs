@@ -140,6 +140,16 @@ pub struct HttpRequest {
     /// Opt-in: an implicit jar would let one host's cookies reach another.
     #[cfg(feature = "cookies")]
     pub cookie_jar: Option<crate::cookies::CookieJar>,
+    /// SPKI pins to enforce on the TLS handshake, if any.
+    ///
+    /// This has to live on the request rather than only on the builder: the
+    /// pinned send path builds its own client (so it can call
+    /// `resolve_to_addrs`), and a pin set on the builder that never reached
+    /// this struct would be silently ignored. Applying it requires the
+    /// `rustls-tls` feature; without it, sending fails with
+    /// [`BeanStreamError::InvalidConfiguration`] rather than connecting
+    /// unpinned.
+    pub cert_pinning: Option<crate::cert_pinning::CertPinConfig>,
     progress: Option<Arc<dyn UploadProgress>>,
 }
 
@@ -160,6 +170,7 @@ impl std::fmt::Debug for HttpRequest {
             .field("cache", &self.cache.is_some())
             .field("rate_limiter", &self.rate_limiter.is_some())
             .field("interceptors", &self.interceptors.len())
+            .field("cert_pinning", &self.cert_pinning.is_some())
             .field("has_progress", &self.progress.is_some())
             .finish()
     }
@@ -182,6 +193,7 @@ impl Clone for HttpRequest {
             interceptors: self.interceptors.clone(),
             #[cfg(feature = "cookies")]
             cookie_jar: self.cookie_jar.clone(),
+            cert_pinning: self.cert_pinning.clone(),
             progress: self.progress.clone(),
         }
     }
@@ -240,6 +252,7 @@ impl HttpRequest {
             interceptors: InterceptorChain::new(),
             #[cfg(feature = "cookies")]
             cookie_jar: None,
+            cert_pinning: None,
             progress: None,
         })
     }
@@ -391,12 +404,30 @@ impl HttpRequest {
 
     /// Re-check the request's scope and headers without sending it.
     ///
-    /// Useful as a pre-flight check, and as a way to confirm a modified request
-    /// is still acceptable. [`Self::send`] performs these checks itself, so
-    /// calling this first is optional.
+    /// Checks three things, all of which [`Self::send`] also enforces:
+    ///
+    /// 1. the URL passes the scope validator,
+    /// 2. every header name/value survives syntax and CRLF validation, and
+    /// 3. no header is one the transport owns (`Host`, `Content-Length`,
+    ///    `Transfer-Encoding`, `Connection`, `TE`).
+    ///
+    /// Step 3 matters because this is the gate every send path goes through, and
+    /// interceptors run *before* it. Checking only syntax here let a middleware
+    /// or a direct push onto the public `headers` field smuggle a `Host` or
+    /// `Content-Length` past the same guard `add_header` applies.
     pub fn validate(&self) -> Result<()> {
         self.scope_validator.check_url(&self.url)?;
-        validate_headers(&self.headers)
+        validate_headers(&self.headers)?;
+
+        for (name, _) in &self.headers {
+            if is_blocked_header(name) {
+                return Err(BeanStreamError::HeaderError(format!(
+                    "Header '{name}' is forbidden"
+                )));
+            }
+        }
+
+        Ok(())
     }
 
     /// Resolve the request hostname to pinned, validated IP addresses.
@@ -452,7 +483,11 @@ impl HttpRequest {
     }
 
     /// Pin the request's own hostname/port. See [`HttpRequest::resolve_pin`].
-    async fn pinned_addresses(&self) -> Result<Option<(String, Vec<SocketAddr>)>> {
+    ///
+    /// Shared with the streaming entry point, which needs the same validated
+    /// address list to pin its own client — a second entry point that skips this
+    /// reopens the DNS-rebinding window P1-1 closed.
+    pub(crate) async fn pinned_addresses(&self) -> Result<Option<(String, Vec<SocketAddr>)>> {
         self.resolve_pin(&self.parsed_url.host, self.parsed_url.port)
             .await
     }
@@ -480,6 +515,26 @@ impl HttpRequest {
             if let Some(store) = jar.provider() {
                 builder = builder.cookie_provider(store);
             }
+        }
+
+        // Certificate pinning has to be installed on *this* client, because this
+        // is the client the pinned send path actually uses. Setting a pin by
+        // hand and then sending through `HttpRequest`/`HttpClientBuilder::send`
+        // used to hand reqwest no TLS config at all, so the pin was silently
+        // inert while `build()` honoured it.
+        #[cfg(feature = "rustls-tls")]
+        if let Some(pinning) = &self.cert_pinning {
+            let tls_config = pinning.build_rustls_config()?;
+            builder = builder.use_preconfigured_tls(tls_config);
+        }
+
+        // Without the rustls backend there is no way to install a pin. Refuse
+        // the request instead of connecting to a certificate nobody checked.
+        #[cfg(not(feature = "rustls-tls"))]
+        if self.cert_pinning.is_some() {
+            return Err(BeanStreamError::InvalidConfiguration(
+                "Certificate pinning requires the 'rustls-tls' feature".to_string(),
+            ));
         }
 
         builder.build().map_err(Into::into)
@@ -666,7 +721,31 @@ impl HttpRequest {
                 )
                 .await
             {
-                Ok(result) => break Ok(result),
+                Ok(result) => {
+                    // A 429 or 5xx arrives here as `Ok`, because `send_target`
+                    // reports every HTTP status as a successful exchange and the
+                    // status-to-error mapping happens after this loop. Deciding
+                    // retryability from the status *inside* the loop is what
+                    // makes `RetryConfig::retry_on` mean anything for
+                    // `ServerError` and `RateLimited`: without this, those two
+                    // classes could never match, since the error they would match
+                    // did not exist yet.
+                    let status = result.0;
+                    let retryable_status = self
+                        .retry
+                        .as_ref()
+                        .is_some_and(|retry| retry.should_retry_status(status));
+
+                    if retryable_status && attempt < max_attempts {
+                        if let (Some(retry), Some(backoff)) = (&self.retry, backoff.as_mut()) {
+                            let delay = retry.next_delay(backoff);
+                            tokio::time::sleep(delay).await;
+                        }
+                        continue;
+                    }
+
+                    break Ok(result);
+                }
                 Err(err) => {
                     if let Some(retry) = &self.retry {
                         if retry.should_retry(&err) && attempt < max_attempts {
@@ -1578,5 +1657,229 @@ mod tests {
         controller.abort();
         let res = req.send().await;
         assert!(matches!(res, Err(BeanStreamError::RequestAborted)));
+    }
+
+    // --- Retry on status actually retries (P0-4) ---
+
+    const SERVICE_UNAVAILABLE: &str = "HTTP/1.1 503 Service Unavailable\r\n\
+                                       Content-Length: 0\r\n\
+                                       Connection: close\r\n\r\n";
+
+    const TOO_MANY_REQUESTS: &str = "HTTP/1.1 429 Too Many Requests\r\n\
+                                     Content-Length: 0\r\n\
+                                     Connection: close\r\n\r\n";
+
+    /// A retry config that waits ~1ms so the retry path is exercised quickly.
+    fn fast_retry() -> crate::retry::RetryConfig {
+        crate::retry::RetryConfig {
+            initial_delay: Duration::from_millis(1),
+            max_delay: Duration::from_millis(2),
+            ..crate::retry::RetryConfig::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_5xx_response_is_retried_up_to_max_attempts() {
+        // Regression: `send_target` reports every HTTP status as `Ok`, and the
+        // status-to-error mapping runs *after* the retry loop — so before this
+        // was fixed, `ErrorKind::ServerError` could never match and a 503 was
+        // returned after a single attempt despite `max_attempts: 3`.
+        let (addr, seen, _server) =
+            spawn_test_server(vec![("/busy".to_string(), SERVICE_UNAVAILABLE)]).await;
+
+        let request = local_request(Method::GET, &addr, "/busy").with_retry(fast_retry());
+        let outcome = request.send().await;
+
+        assert_eq!(
+            seen.lock().await.len(),
+            3,
+            "a 5xx must be retried up to max_attempts (3)"
+        );
+        assert!(
+            matches!(outcome, Err(BeanStreamError::ServerError(503))),
+            "the caller still sees the final status as an error, got {outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_429_response_is_retried() {
+        let (addr, seen, _server) =
+            spawn_test_server(vec![("/throttled".to_string(), TOO_MANY_REQUESTS)]).await;
+
+        let request = local_request(Method::GET, &addr, "/throttled").with_retry(fast_retry());
+        let outcome = request.send().await;
+
+        assert_eq!(seen.lock().await.len(), 3, "429 must be retried");
+        assert!(matches!(outcome, Err(BeanStreamError::RateLimited)));
+    }
+
+    #[tokio::test]
+    async fn a_5xx_is_not_retried_when_not_in_retry_on() {
+        // The retry decision still comes from `retry_on`, so removing the class
+        // disables the behaviour rather than the retry being unconditional.
+        let (addr, seen, _server) =
+            spawn_test_server(vec![("/busy".to_string(), SERVICE_UNAVAILABLE)]).await;
+
+        let config = crate::retry::RetryConfig {
+            retry_on: vec![crate::retry::ErrorKind::NetworkTimeout],
+            ..fast_retry()
+        };
+        let request = local_request(Method::GET, &addr, "/busy").with_retry(config);
+        let _ = request.send().await;
+
+        assert_eq!(
+            seen.lock().await.len(),
+            1,
+            "a 5xx must not be retried when ServerError is not in retry_on"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_success_response_is_not_retried() {
+        let (addr, seen, _server) = spawn_test_server(vec![]).await;
+
+        let request = local_request(Method::GET, &addr, "/ok").with_retry(fast_retry());
+        let outcome = request.send().await;
+
+        assert!(outcome.is_ok());
+        assert_eq!(seen.lock().await.len(), 1, "2xx must never be retried");
+    }
+
+    // --- Forbidden headers cannot be smuggled past validate() ---
+
+    #[test]
+    fn validate_rejects_a_blocked_header_pushed_directly() {
+        // `add_header` checks the blocked list, but `validate()` used to check
+        // only name syntax and CRLF. Since every send path goes through
+        // `validate()` and `headers` is a public field, that gap let `Host` and
+        // `Content-Length` be smuggled in.
+        let mut request = HttpRequest::get("https://8.8.8.8/").unwrap();
+        request
+            .headers
+            .push(("host".to_string(), "evil.example".to_string()));
+
+        let outcome = request.validate();
+        assert!(
+            matches!(&outcome, Err(BeanStreamError::HeaderError(message))
+                if message.contains("host")),
+            "expected the blocked-header guard to fire, got {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_every_transport_owned_header() {
+        for blocked in [
+            "host",
+            "connection",
+            "transfer-encoding",
+            "content-length",
+            "te",
+        ] {
+            let mut request = HttpRequest::get("https://8.8.8.8/").unwrap();
+            request.headers.push((blocked.to_string(), "x".to_string()));
+            assert!(
+                request.validate().is_err(),
+                "validate() must reject the transport-owned header '{blocked}'"
+            );
+        }
+    }
+
+    #[test]
+    fn build_request_refuses_a_smuggled_host_header() {
+        // `build_request` calls `validate()`, so the guard covers the
+        // build-your-own-request path too — this is what the probe showed
+        // produced a request carrying `Host: evil.example`.
+        let mut request = HttpRequest::get("https://8.8.8.8/").unwrap();
+        request
+            .headers
+            .push(("host".to_string(), "evil.example".to_string()));
+        request
+            .headers
+            .push(("content-length".to_string(), "999".to_string()));
+
+        assert!(request.validate().is_err());
+    }
+
+    #[tokio::test]
+    async fn an_interceptor_cannot_inject_a_blocked_header() {
+        // Interceptors run *before* validation by design, so the guard has to
+        // catch what they add. This is the realistic middleware route to the
+        // same bypass.
+        use std::sync::Arc;
+
+        use crate::interceptor::Interceptor;
+
+        struct InjectHost;
+        impl Interceptor for InjectHost {
+            fn on_request(&self, req: &mut HttpRequest) -> Result<()> {
+                req.headers
+                    .push(("host".to_string(), "evil.example".to_string()));
+                Ok(())
+            }
+            fn on_response(&self, _resp: &mut HttpResponse) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        let (addr, seen, _server) = spawn_test_server(vec![]).await;
+        let request =
+            local_request(Method::GET, &addr, "/ok").add_interceptor(Arc::new(InjectHost));
+
+        let outcome = request.send().await;
+        assert!(
+            matches!(outcome, Err(BeanStreamError::HeaderError(_))),
+            "an injected Host header must be refused, got {outcome:?}"
+        );
+        assert_eq!(
+            seen.lock().await.len(),
+            0,
+            "the request must not reach the server at all"
+        );
+    }
+
+    // --- Certificate pinning reaches the pinned send path ---
+
+    #[cfg(feature = "rustls-tls")]
+    #[test]
+    fn request_with_pinning_builds_a_pinned_client() {
+        // `build_client` is the client the pinned send path uses, so this is
+        // where the pin has to be installed. Before this was fixed, the TLS
+        // config was applied only in `HttpClientBuilder::build()` and the
+        // request carried no pin at all.
+        //
+        // Kept network-free by using an empty pin set: that is a configuration
+        // error inside `build_rustls_config`, so it failing proves the pinning
+        // code is reached on this path rather than skipped.
+        let mut request = HttpRequest::get("https://8.8.8.8/").unwrap();
+        assert!(request.cert_pinning.is_none());
+
+        request.cert_pinning = Some(crate::cert_pinning::CertPinConfig::new());
+        assert!(
+            matches!(
+                request.build_client(None),
+                Err(BeanStreamError::InvalidConfiguration(_))
+            ),
+            "the pinned send path must consult cert_pinning"
+        );
+
+        // A real pin produces a usable client: reqwest accepted the TLS config.
+        request.cert_pinning =
+            Some(crate::cert_pinning::CertPinConfig::new().pin_spki_sha256([0x11; 32]));
+        assert!(request.build_client(None).is_ok());
+    }
+
+    #[cfg(not(feature = "rustls-tls"))]
+    #[test]
+    fn request_with_pinning_without_rustls_is_refused() {
+        let mut request = HttpRequest::get("https://8.8.8.8/").unwrap();
+        request.cert_pinning =
+            Some(crate::cert_pinning::CertPinConfig::new().pin_spki_sha256([0x11; 32]));
+
+        let outcome = request.build_client(None);
+        assert!(
+            matches!(&outcome, Err(BeanStreamError::InvalidConfiguration(message))
+                if message.contains("rustls-tls")),
+            "expected a loud configuration error, got {outcome:?}"
+        );
     }
 }

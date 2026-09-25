@@ -71,16 +71,55 @@ impl Stream for ByteStream {
 /// Fails before connecting if the URL/headers fail validation or if any
 /// `on_request` interceptor fails; fails on the first network error while
 /// streaming.
+///
+/// The host is resolved once here and the validated addresses are pinned into
+/// the client, exactly as [`HttpRequest::send`](crate::HttpRequest::send) does.
+/// This matters because [`validate_url`](crate::validate_url) deliberately
+/// performs no DNS for domain hosts (P1-2), so without the pin a hostname
+/// resolving to a private address would pass validation and connect anyway.
+/// Certificate pinning and the cookie jar are carried over from the request for
+/// the same reason.
 pub async fn download_stream(request: &HttpRequest) -> Result<ByteStream> {
     let interceptors = request.interceptors.clone();
     let mut prepared = request.clone();
     interceptors.run_on_request(&mut prepared)?;
     prepared.validate()?;
 
-    let client = reqwest::Client::builder()
+    // P1-1: resolve and validate the addresses, then pin them, so the
+    // connect-time lookup cannot be swapped for a private address.
+    let pinned = prepared.pinned_addresses().await?;
+
+    let mut client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
-        .timeout(prepared.timeout)
-        .build()?;
+        .timeout(prepared.timeout);
+
+    if let Some((host, addresses)) = &pinned {
+        client = client.resolve_to_addrs(host, addresses);
+    }
+
+    #[cfg(feature = "cookies")]
+    if let Some(jar) = &prepared.cookie_jar {
+        if let Some(store) = jar.provider() {
+            client = client.cookie_provider(store);
+        }
+    }
+
+    // Same rule as the non-streaming path: a pin that cannot be installed is a
+    // hard error, never a silently unpinned connection.
+    #[cfg(feature = "rustls-tls")]
+    if let Some(pinning) = &prepared.cert_pinning {
+        let tls_config = pinning.build_rustls_config()?;
+        client = client.use_preconfigured_tls(tls_config);
+    }
+
+    #[cfg(not(feature = "rustls-tls"))]
+    if prepared.cert_pinning.is_some() {
+        return Err(BeanStreamError::InvalidConfiguration(
+            "Certificate pinning requires the 'rustls-tls' feature".to_string(),
+        ));
+    }
+
+    let client = client.build()?;
 
     let mut outbound = client.request(prepared.method.clone(), &prepared.url);
     use reqwest::header::{HeaderName, HeaderValue};
@@ -169,6 +208,52 @@ mod tests {
             stream_from_response(response),
             Err(BeanStreamError::ServerError(503))
         ));
+    }
+
+    #[tokio::test]
+    async fn a_hostname_resolving_to_a_private_address_is_refused() {
+        // Regression: `validate_url` performs no DNS for domain hosts (P1-2), so
+        // a name pointing at a private address passes URL validation. Without
+        // the resolve-and-pin step, `download_stream` would connect to it.
+        //
+        // Built the same way the redirect tests build local targets: start from
+        // a validated public URL and retarget the parsed host, which is what the
+        // resolution step consumes. The scope validator is opened so the failure
+        // under test is the address check, not a host-allow-list rejection.
+        let mut request = HttpRequest::get("https://8.8.8.8/").unwrap();
+        request.url = "https://localhost:9/".to_string();
+        request.parsed_url.port = 9;
+        request.parsed_url.host = crate::url_validation::ValidatedHost {
+            host: "localhost".to_string(),
+            ip_addr: None, // a name, so it must be resolved
+        };
+        request.scope_validator = crate::redirect_policy::ScopeValidator::new(false);
+
+        let outcome = download_stream(&request).await;
+        assert!(
+            matches!(&outcome, Err(BeanStreamError::PrivateNetworkAccess(_))),
+            "a name resolving to loopback must be refused by the resolution step, got {:?}",
+            outcome.err().map(|e| e.to_string())
+        );
+    }
+
+    #[cfg(feature = "rustls-tls")]
+    #[tokio::test]
+    async fn pinning_is_refused_when_the_pin_set_is_empty() {
+        // Proves `download_stream` consults `cert_pinning` at all: an empty pin
+        // set is a configuration error inside `build_rustls_config`, so it
+        // surfacing here means the streaming path installs pins just as the
+        // non-streaming path does. Before the fix it built a plain client and
+        // this would have connected.
+        let mut request = HttpRequest::get("https://8.8.8.8/").unwrap();
+        request.cert_pinning = Some(crate::cert_pinning::CertPinConfig::new());
+
+        let outcome = download_stream(&request).await;
+        assert!(
+            matches!(&outcome, Err(BeanStreamError::InvalidConfiguration(_))),
+            "an empty pin set must fail the stream, got {:?}",
+            outcome.err().map(|e| e.to_string())
+        );
     }
 
     #[tokio::test]

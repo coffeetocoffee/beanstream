@@ -260,14 +260,24 @@ BeanStream rides on `reqwest` with `rustls`, so it compiles and runs cleanly on:
 
 ---
 
-## Roadmap
+## Status
 
-| Version | Focus |
-|---------|-------|
-| v0.1.x | Core validation, builder, request handling *(current)* |
-| v1.0.x | Response caching, retry w/ backoff |
-| v1.1.x | Streaming, progress tracking, rate limiting |
-| v1.2.x | WebSocket support, middleware chain |
+Everything originally listed as a future milestone is implemented and gated in
+CI. The crate version in `Cargo.toml` is still `0.1.0`; the `v0.4.0`–`v0.8.4`
+tags are release markers, so nothing has been published to crates.io.
+
+| Capability | State |
+|-----------|-------|
+| URL, IP, path & header validation | ✅ implemented |
+| Builder and request handling | ✅ implemented |
+| Response caching (TTL, ETag, Cache-Control) | ✅ implemented |
+| Retry with exponential backoff | ✅ implemented, by error class and by status |
+| Streaming, progress tracking, rate limiting | ✅ implemented |
+| WebSocket, middleware chain | ✅ implemented (feature-gated) |
+| DNS pinning + SSRF checks on every send path | ✅ implemented |
+| Certificate pinning | ✅ implemented, needs the `rustls-tls` feature |
+| Proxy support | ⬜ not implemented |
+| Benchmarks, licence audit, JS/TS bridge | ⬜ not started |
 
 ---
 

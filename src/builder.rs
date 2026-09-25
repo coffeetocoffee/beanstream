@@ -175,10 +175,16 @@ impl HttpClientBuilder {
     /// SHA-256 pins (P0-9).
     ///
     /// Pinning is installed as a preconfigured rustls client, so it requires the
-    /// `rustls-tls` feature. Without that feature, [`Self::build`] and the
-    /// pinned send path return [`BeanStreamError::InvalidConfiguration`] rather
-    /// than producing a client that merely looks pinned — a pin that is
-    /// silently ignored is worse than a clear failure.
+    /// `rustls-tls` feature. Without that feature, `build()` and the pinned send
+    /// path both return [`BeanStreamError::InvalidConfiguration`] rather than
+    /// producing a client that merely looks pinned — a pin that is silently
+    /// ignored is worse than a clear failure.
+    ///
+    /// The pin applies to requests from [`Self::create_request`] and
+    /// [`Self::send`] as well as to [`Self::build`]: it is carried on the
+    /// request and installed on the client the pinned path builds for itself.
+    /// Previously only `build()` honoured it, which meant the recommended path
+    /// (the one that pins DNS) silently skipped certificate pinning.
     pub fn with_cert_pinning(mut self, config: CertPinConfig) -> Self {
         self.cert_pinning = Some(config);
         self
@@ -359,6 +365,13 @@ impl HttpClientBuilder {
                 request.cookie_jar = Some(jar.clone());
             }
 
+            // Carry the pins onto the request so the pinned send path installs
+            // them on the client it builds. Without this the pin existed only on
+            // the builder and was honoured by build() alone.
+            if let Some(pinning) = &self.cert_pinning {
+                request.cert_pinning = Some(pinning.clone());
+            }
+
             // Default headers are validated at add_default_header() time.
             request.headers.extend(self.default_headers.iter().cloned());
 
@@ -450,6 +463,55 @@ mod tests {
             .with_cert_pinning(config)
             .build()
             .is_err());
+    }
+
+    #[test]
+    fn created_requests_carry_the_builders_certificate_pins() {
+        // Regression: the pin lived only on the builder, and only `build()`
+        // installed it. Requests from `create_request()` — the path that also
+        // pins DNS — therefore dropped certificate pinning entirely, so a pin
+        // configured by the caller was silently not enforced on send.
+        let config = CertPinConfig::new().pin_spki_sha256([0x11; 32]);
+        let builder = HttpClientBuilder::default()
+            .with_base_url("https://8.8.8.8/")
+            .with_cert_pinning(config);
+
+        let request = builder.create_request(Method::GET, "users").unwrap();
+        let forwarded = request
+            .cert_pinning
+            .as_ref()
+            .expect("create_request must forward the builder's pins");
+        assert!(
+            !forwarded.is_empty(),
+            "the forwarded pin must be the configured one, not a default"
+        );
+
+        // And a builder without pinning must not fabricate one.
+        let plain = HttpClientBuilder::default()
+            .with_base_url("https://8.8.8.8/")
+            .create_request(Method::GET, "users")
+            .unwrap();
+        assert!(plain.cert_pinning.is_none());
+    }
+
+    /// The forwarded pin must still be a usable TLS config.
+    ///
+    /// Network-free by design: `build_rustls_config` on a real pin succeeds
+    /// without any connection, so this proves the forwarded value is the
+    /// configured pin rather than a placeholder that would fail at handshake
+    /// time.
+    #[cfg(feature = "rustls-tls")]
+    #[test]
+    fn a_forwarded_pin_builds_a_tls_config() {
+        let config = CertPinConfig::new().pin_spki_sha256([0x11; 32]);
+        let request = HttpClientBuilder::default()
+            .with_base_url("https://8.8.8.8/")
+            .with_cert_pinning(config)
+            .create_request(Method::GET, "users")
+            .unwrap();
+
+        let forwarded = request.cert_pinning.expect("pin must be forwarded");
+        assert!(forwarded.build_rustls_config().is_ok());
     }
 
     #[test]

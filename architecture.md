@@ -201,32 +201,69 @@ Redirects are tracked and validated against scope policies:
 
 ```rust
 pub struct RedirectPolicy {
-    allowed_hosts: HashSet<String>,
-    max_redirects: usize,
-    track_all_redirects: bool,
+    pub max_redirects: usize,
+    pub track_all_redirects: bool,
+    pub allowed_hosts: HashSet<String>,
+    pub denied_hosts: HashSet<String>,
+    pub allow_any_redirect: bool,
+    /// Whether `HttpRequest::send` walks 3xx chains at all (P1-4).
+    pub follow_redirects: bool,
+    /// Whether an `https` -> `http` hop is tolerated (P1-5).
+    pub allow_scheme_downgrade: bool,
 }
 
 impl RedirectPolicy {
     pub fn check_redirect(&self, previous_urls: &[Url], next_url: &Url) -> Result<()> {
-        // Limit redirect chain length
+        // Chain length.
         if previous_urls.len() >= self.max_redirects {
-            return Err(Error::TooManyRedirects);
+            return Err(BeanStreamError::TooManyRedirects(self.max_redirects));
         }
-        
-        // Validate destination host if tracking enabled
-        if self.track_all_redirects {
-            let host = next_url.host_str().ok_or(Error::NoHost)?;
-            if !self.allowed_hosts.contains(host) {
-                return Err(Error::HostNotAllowed(next_url.clone()));
+
+        // Only http/https destinations.
+        if next_url.scheme() != "http" && next_url.scheme() != "https" {
+            return Err(BeanStreamError::RedirectBlocked(/* ... */));
+        }
+
+        // Refuse to drop TLS, checked across the whole chain so
+        // https -> http -> https cannot launder a downgrade.
+        if !self.allow_scheme_downgrade {
+            let chain_used_tls = previous_urls
+                .iter()
+                .chain(std::iter::once(next_url))
+                .any(|url| url.scheme() == "https");
+            if chain_used_tls && next_url.scheme() == "http" {
+                return Err(BeanStreamError::RedirectBlocked(/* ... */));
             }
         }
-        
-        Ok(())
+
+        let next_host = next_url.host_str().ok_or(BeanStreamError::NoHost)?;
+
+        // Deny beats allow, and an unknown host is refused unless
+        // `allow_any_redirect` is set.
+        if self.denied_hosts.iter().any(|d| matches_host_pattern(d, next_host)) {
+            return Err(BeanStreamError::RedirectBlocked(/* ... */));
+        }
+        if !self.track_all_redirects && self.allow_any_redirect {
+            return Ok(());
+        }
+        if self.allowed_hosts.iter().any(|a| matches_host_pattern(a, next_host)) {
+            return Ok(());
+        }
+
+        Err(BeanStreamError::HostNotAllowed(next_host.to_string()))
     }
 }
 ```
 
 Prevents open redirect attacks while allowing legitimate navigation chains.
+
+Two points that are easy to get wrong. `follow_redirects` defaults to `false`
+and the length/scheme rules apply **either way** — the flag only decides whether
+the chain is walked, not whether the policy is enforced. And the chain is walked
+by BeanStream, never by reqwest: the client is pinned to
+`reqwest::redirect::Policy::none()` so that every hop goes through the checks
+above, with its own URL validation and its own DNS pin. Handing the job to
+reqwest would bypass all of it.
 
 ---
 
@@ -236,20 +273,25 @@ Prevents open redirect attacks while allowing legitimate navigation chains.
 
 BeanStream ships with capabilities that typically require multiple libraries or manual implementation:
 
-#### 🎯 AbortController Integration
+#### 🎯 Cancellation
 
-```javascript
-// Cancel requests instantly
-const controller = new AbortController();
+```rust
+use beanstream::{create_abort_signal, execute_with_abort, HttpRequest};
 
-fetch('https://api.example.com/large-download', {
-  signal: controller.signal
-}).then(response => {
-  // Handle result
+# async fn run() -> Result<(), beanstream::BeanStreamError> {
+let (controller, signal) = create_abort_signal();
+let request = HttpRequest::get("https://api.example.com/large-download")?;
+
+// Cancel from anywhere: another task, a UI handler, a timer.
+let handle = tokio::spawn(async move {
+    execute_with_abort(request, signal).await
 });
 
-// Stop it anytime
 controller.abort();
+let outcome = handle.await.unwrap();
+assert!(matches!(outcome, Err(beanstream::BeanStreamError::RequestAborted)));
+# Ok(())
+# }
 ```
 
 Perfect for:
@@ -257,18 +299,23 @@ Perfect for:
 - Timeout fallbacks
 - Race condition handling
 
+An already-aborted signal fails before any connection is attempted, so aborting
+first is a cheap way to short-circuit work.
+
 #### 📊 Real-Time Progress Tracking
 
 ```rust
-pub trait UploadProgress: Send + Sync {
-    fn on_progress(&self, uploaded: u64, total: Option<u64>) -> bool;
-}
+use beanstream::HttpRequest;
 
-// Usage
-client.upload("large-file.zip")
-    .with_progress(UploadTracker::new())
-    .send()
-    .await?;
+# fn run() -> Result<(), beanstream::BeanStreamError> {
+let request = HttpRequest::post("https://api.example.com/upload")?
+    .body("payload")
+    .with_progress(|transferred: u64, total: Option<u64>| {
+        println!("{transferred}/{total:?}");
+        true // return false to cancel the request
+    });
+# Ok(())
+# }
 ```
 
 Get immediate feedback on:
@@ -276,10 +323,20 @@ Get immediate feedback on:
 - Download transfers
 - Form submissions
 
+Returning `false` from the callback cancels the request and surfaces
+`RequestAborted`, so the tracker doubles as a cooperative cancellation hook.
+Any `Fn(u64, Option<u64>) -> bool` implements `UploadProgress`, so a closure is
+usually all you need.
+
 #### 🔄 Automatic Retry Logic
 
 ```rust
-let client = HttpClientBuilder::default()
+use std::time::Duration;
+
+use beanstream::{ErrorKind, HttpRequest, RetryConfig};
+
+// Retry is configured per request, not on the builder.
+let request = HttpRequest::get("https://api.example.com/data")?
     .with_retry(RetryConfig {
         max_attempts: 5,
         initial_delay: Duration::from_millis(100),
@@ -290,73 +347,128 @@ let client = HttpClientBuilder::default()
             ErrorKind::ServerError,
             ErrorKind::RateLimited,
         ],
-    })
-    .build()?;
+    });
+
+let response = request.send().await?;
+# Ok::<(), beanstream::BeanStreamError>(())
 ```
 
 Handles transient failures gracefully:
 - Network glitches
-- Server overloads
-- Rate limiting
+- Server overloads (5xx)
+- Rate limiting (429)
 - Connection drops
+
+Which failures are repeated is decided by `retry_on`, and both transports are
+covered: a transport error is classified through `classify_error`, and a 429/5xx
+*response* is checked with `RetryConfig::should_retry_status` inside the attempt
+loop. That second path matters — the status-to-error mapping happens after the
+loop, so statuses must be judged as they arrive, not after the fact. A 2xx is
+never retried.
+
+> **Trade-off worth stating:** a retried 5xx means the request body is replayed.
+> That is safe for idempotent methods and for a 429 that the server rejected
+> outright, but a 5xx on a `POST` may have had a side effect before failing. If
+> that matters, narrow `retry_on` to `ErrorKind::NetworkTimeout` for
+> non-idempotent calls.
 
 #### 🗄️ Intelligent Response Caching
 
 ```rust
-let cache = InMemoryCache::new(CacheConfig {
-    default_ttl: Duration::from_minutes(5),
+use std::sync::Arc;
+use std::time::Duration;
+
+use beanstream::{CacheConfig, HttpRequest, InMemoryCache};
+
+let cache = Arc::new(InMemoryCache::new(CacheConfig {
+    default_ttl: Duration::from_secs(300),
     use_etags: true,
     use_cache_control: true,
     max_size: 10_000,
-});
+}));
 
-let client = HttpClientBuilder::default()
-    .with_cache(cache)
-    .build()?;
+// The cache is attached per request, and shared by cloning the Arc.
+let request = HttpRequest::get("https://api.example.com/data")?.with_cache(cache);
+# Ok::<(), beanstream::BeanStreamError>(())
 ```
 
 Reduces redundant requests:
 - Conditional GETs with ETag support
 - Cache-Control header parsing
-- Automatic invalidation
+- Automatic invalidation via `invalidate` / `invalidate_url` / `clear`
+
+Only `GET` and `HEAD` are cached, and only successful responses. Cached entries
+hold the **redacted** response, so a cache hit cannot surface a header that a
+fresh response would have stripped.
 
 #### ⚡ Streaming Support
 
 Process responses chunk-by-chunk without full buffering:
 
 ```rust
-use futures::{StreamExt, TryStreamExt};
+use beanstream::download_stream;
 
-let mut stream = client.download_stream("large-video.mp4").await?;
+# async fn run() -> Result<(), beanstream::BeanStreamError> {
+use futures_util::StreamExt;
 
-while let Some(chunk) = stream.try_next().await? {
-    process_chunk(&chunk)?;
+let request = beanstream::HttpRequest::get("https://example.com/large-file")?;
+let mut stream = download_stream(&request).await?;
+
+while let Some(chunk) = stream.next().await {
+    let chunk = chunk?;
+    // process_chunk(&chunk);
+    let _ = chunk;
 }
+# Ok(())
+# }
 ```
 
 Enables:
-- Real-time video playback
+- Real-time media playback
 - Progressive image loading
 - Efficient large file handling
+
+`download_stream` resolves the host and pins the validated addresses, exactly as
+`HttpRequest::send` does, and carries the request's certificate pins and cookie
+jar over. Note that streaming does **not** follow redirects (the client is built
+with `Policy::none`) and does not run `on_response` interceptors — use
+`HttpRequest::send` when you need either.
 
 #### 🎭 Middleware Architecture
 
 Extend functionality with pluggable interceptors:
 
 ```rust
-pub trait Interceptor: Send + Sync {
-    fn on_request(&self, req: &mut Request) -> Result<()>;
-    fn on_response(&self, resp: &mut Response) -> Result<()>;
+use beanstream::{HttpRequest, HttpResponse, Interceptor, Result};
+
+struct Tagging;
+impl Interceptor for Tagging {
+    fn on_request(&self, req: &mut HttpRequest) -> Result<()> {
+        req.headers.push(("x-trace".into(), "abc".into()));
+        Ok(())
+    }
+    fn on_response(&self, _resp: &mut HttpResponse) -> Result<()> {
+        Ok(())
+    }
 }
 
 // Add logging middleware
-client.add_interceptor(LoggingInterceptor::default());
+# let client = beanstream::HttpRequest::get("https://8.8.8.8/")?;
+client.add_interceptor(std::sync::Arc::new(beanstream::LoggingInterceptor));
 
 // Add authentication middleware
-client.add_interceptor(AuthInterceptor::new(token));
+# let client = beanstream::HttpRequest::get("https://8.8.8.8/")?;
+client.add_interceptor(std::sync::Arc::new(beanstream::AuthInterceptor::new("token")));
+# Ok::<(), beanstream::BeanStreamError>(())
 ```
 
 Build exactly what you need without modifying core code.
+
+Two properties worth knowing: interceptors run **before** validation, so anything
+they inject is still checked — including the blocked-header guard, which means a
+middleware cannot smuggle a `Host` header. And response redaction is applied
+**again** after `on_response`, so an interceptor that injects a credential cannot
+leave it in what the caller receives.
 
 ---
 
@@ -408,12 +520,40 @@ BeanStream follows a modular design pattern that makes it easy to understand, ex
 |-----------|-----------|---------|
 | **Request Object** | Custom struct | Encapsulate all request data |
 | **Middleware Chain** | trait objects | Inject logging/auth/cache |
-| **Validation Engine** | Custom validator | URL/IP/header checks |
+| **Validation Engine** | Custom validator | URL/IP/path/header checks, including the blocked-header guard |
 | **Rate Limiter** | Semaphore-based | Control concurrency |
 | **Cache Layer** | DashMap + TTL | Reduce redundant requests |
-| **Retry Manager** | ExponentialBackoff | Handle transient failures |
-| **Executor** | reqwest + tokio | Perform actual network ops |
-| **Response Stream** | Tokio Pipe | Streaming chunks |
+| **Retry Manager** | ExponentialBackoff | Handle transient failures, by error class *and* by status |
+| **Executor** | reqwest + tokio | Perform actual network ops, with DNS pinned to pre-validated addresses |
+| **Response Stream** | reqwest byte stream | Streaming chunks |
+
+### The send pipeline, in order
+
+`HttpRequest::send` is where the layers compose, and the sequence is load-bearing:
+
+```
+interceptors.on_request          // middleware may mutate the request
+  └─> validate()                 // scope + header syntax + blocked-header guard
+       └─> abort check           // fail before connecting if already cancelled
+            └─> rate-limit permit
+                 └─> cache lookup (GET/HEAD only)
+                      └─> resolve once, validate every address, pin them
+                           └─> attempt loop
+                                ├─ transport error  -> classify_error -> retry?
+                                └─ 429 / 5xx status -> should_retry_status -> retry?
+                                     └─> redirect chain walk (if enabled)
+                                          └─> per hop: validate, re-pin, re-check
+                                               └─> redact headers
+                                                    └─> interceptors.on_response
+                                                         └─> redact again
+```
+
+Two details are deliberate rather than incidental. The DNS pin is computed
+**before** the attempt loop, so a retry cannot re-resolve to a different address —
+otherwise a rebinding attacker could simply fail the first attempt to win the
+second. And redaction runs **twice**, because an interceptor is allowed to inject
+headers (an auth refresh, say) and the second pass is what stops it from leaking
+one to the caller.
 
 Each component operates independently, making the system resilient to individual failures and easy to test.
 
@@ -461,13 +601,24 @@ Ensure flawless operation everywhere:
 - ✅ iOS ATS configuration generation
 - ✅ Android network security config
 - ✅ Certificate pinning implementation
-- ✅ Native proxy integration
+- ⬜ Native proxy integration — **not implemented**
 
 #### Week 6: Desktop & Systems
-- ✅ Linux environment variable proxy support
-- ✅ macOS CFNetwork proxy integration
-- ✅ Windows system proxy detection
-- ✅ Cross-platform test suite
+- ⬜ Linux environment variable proxy support — **not implemented**
+- ⬜ macOS CFNetwork proxy integration — **not implemented**
+- ⬜ Windows system proxy detection — **not implemented**
+- ⚠️ Cross-platform test suite — CI covers Linux, Windows and macOS (see
+  [Continuous Integration](#continuous-integration)), but the tests are
+  network-free, so no platform's *real* network stack behaviour is exercised
+
+> **Correction (proxy support).** These four items were previously marked ✅.
+> They are not implemented: `grep -ri proxy src/` returns nothing, there is no
+> `Proxy` type, no environment-variable handling, and nothing in `Cargo.toml`
+> enables reqwest's proxy support. A proxy would also need a decision this crate
+> has not made — whether proxy resolving should bypass the private-address
+> checks — so it is listed as open work rather than a checkbox. If you need a
+> proxy today, reqwest's own configuration is the way, and it must be applied to
+> a client you build yourself.
 
 ---
 
@@ -560,7 +711,7 @@ Measured on 2026-09-25 with `cargo llvm-cov --all-features --workspace`:
 
 | Scope | Line coverage | Lines hit / total |
 |-------|---------------|-------------------|
-| **crate total** | **85.3%** | 2888 / 3384 |
+| **crate total** | **85.8%** | 3149 / 3671 |
 | `header_validation.rs` | 99.2% | 126 / 127 |
 | `platform_config.rs` | 98.8% | 164 / 166 |
 | `retry.rs` | 98.6% | 71 / 72 |
@@ -569,13 +720,13 @@ Measured on 2026-09-25 with `cargo llvm-cov --all-features --workspace`:
 | `cache.rs` | 92.1% | 198 / 215 |
 | `progress.rs` | 89.7% | 26 / 29 |
 | `url_validation.rs` | 86.9% | 359 / 413 |
+| `request_handler.rs` | 86.7% | 987 / 1138 |
+| `builder.rs` | 85.4% | 275 / 322 |
 | `cookies.rs` | 84.8% | 28 / 33 |
-| `request_handler.rs` | 84.3% | 829 / 983 |
-| `builder.rs` | 83.9% | 244 / 291 |
 | `interceptor.rs` | 81.9% | 104 / 127 |
-| `websocket.rs` | 80.4% | 41 / 51 |
-| `cert_pinning.rs` | 72.9% | 180 / 247 |
-| `streaming.rs` | 66.9% | 87 / 130 |
+| `cert_pinning.rs` | 74.1% | 183 / 247 |
+| `streaming.rs` | 72.1% | 129 / 179 |
+| `websocket.rs` | 66.0% | 68 / 103 |
 | `abort.rs` | 62.9% | 66 / 105 |
 | `error_handling_impl.rs` | 25.0% | 3 / 12 |
 
@@ -592,12 +743,21 @@ doctests drawn from this crate's rustdoc, on every feature combination
 
 The low rows are honest and explain themselves. `error_handling_impl.rs` is
 almost entirely `#[derive(Error)]` and `From` impls whose generated code has no
-branches to exercise. `abort.rs` and `streaming.rs` are dominated by the
-`tokio::select!` and `Stream` poll paths that only run on a real in-flight
-transfer, and the network-free test policy (below) deliberately avoids long
-transfers. `cert_pinning.rs` has a large DER-walking surface that needs real
-certificate fixtures. Raising those three is tracked as open work rather than
-claimed as done.
+branches to exercise. `abort.rs` is dominated by the `tokio::select!` path that
+only runs on a real in-flight transfer. `websocket.rs` and `cert_pinning.rs` need
+a live TLS peer and real certificate fixtures respectively; the network-free test
+policy (below) deliberately avoids both, so their uncovered lines are the success
+paths of code that CI proves compiles and whose *failure* paths are asserted.
+
+#### What the tests deliberately do not cover
+
+Worth stating plainly, because it is the main reason the four defects fixed in
+v0.8.4 existed: module-level unit tests cannot see wiring. Every one of those
+bugs was a feature configured on one layer and never read by the layer that acted
+on it — the pin set on the builder but not the request, the retry class listed but
+never matched, the forbidden-header guard present in `add_header` but absent from
+`validate`. Each is now covered by a test that fails if the wiring is removed,
+which is the only kind of test that catches this class.
 
 #### Network-Free Test Policy
 
