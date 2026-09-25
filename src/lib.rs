@@ -2,6 +2,8 @@ mod abort;
 mod builder;
 mod cache;
 mod cert_pinning;
+#[cfg(feature = "cookies")]
+mod cookies;
 mod error_handling_impl;
 mod header_validation;
 mod interceptor;
@@ -22,6 +24,8 @@ pub use abort::{
 pub use builder::HttpClientBuilder;
 pub use cache::{CacheConfig, InMemoryCache};
 pub use cert_pinning::{spki_sha256, CertPinConfig};
+#[cfg(feature = "cookies")]
+pub use cookies::CookieJar;
 pub use error_handling_impl::{BeanStreamError, Result};
 pub use header_validation::{
     is_blocked_header, is_sensitive_header, redact_sensitive_headers, sanitize_header,

@@ -23,6 +23,8 @@ pub struct HttpClientBuilder {
     check_private_ips: bool,
     cert_pinning: Option<CertPinConfig>,
     interceptors: InterceptorChain,
+    #[cfg(feature = "cookies")]
+    cookie_jar: Option<crate::cookies::CookieJar>,
 }
 
 impl Default for HttpClientBuilder {
@@ -38,6 +40,8 @@ impl Default for HttpClientBuilder {
             check_private_ips: true,
             cert_pinning: None,
             interceptors: InterceptorChain::new(),
+            #[cfg(feature = "cookies")]
+            cookie_jar: None,
         }
     }
 }
@@ -99,8 +103,25 @@ impl HttpClientBuilder {
         self
     }
 
+    /// Give every request created by this builder a shared cookie jar (P2-2).
+    ///
+    /// Cookies are opt-in rather than always-on: an implicit jar would let one
+    /// host's `Set-Cookie` ride along to unrelated later requests. Passing a
+    /// jar makes the choice explicit, and it is still scoped per origin by the
+    /// underlying store.
+    #[cfg(feature = "cookies")]
+    pub fn with_cookie_jar(mut self, jar: crate::cookies::CookieJar) -> Self {
+        self.cookie_jar = Some(jar);
+        self
+    }
+
     /// Require every TLS connection to match one of the configured SPKI
     /// SHA-256 pins (P0-9).
+    ///
+    /// Pinning is enforced by installing a preconfigured rustls client, so it
+    /// needs the `rustls-tls` feature. Without it, setting a pin is silently
+    /// inert — better to fail at request time than to look pinned while
+    /// trusting any certificate.
     pub fn with_cert_pinning(mut self, config: CertPinConfig) -> Self {
         self.cert_pinning = Some(config);
         self
@@ -150,9 +171,27 @@ impl HttpClientBuilder {
         }
         client = client.default_headers(headers);
 
+        #[cfg(feature = "cookies")]
+        if let Some(jar) = &self.cookie_jar {
+            if let Some(store) = jar.provider() {
+                client = client.cookie_provider(store);
+            }
+        }
+
+        // P2-2: pinning needs reqwest's rustls backend to install a
+        // preconfigured TLS config. Refuse loudly rather than build a client
+        // that looks pinned but accepts any certificate.
+        #[cfg(feature = "rustls-tls")]
         if let Some(pinning) = &self.cert_pinning {
             let tls_config = pinning.build_rustls_config()?;
             client = client.use_preconfigured_tls(tls_config);
+        }
+
+        #[cfg(not(feature = "rustls-tls"))]
+        if self.cert_pinning.is_some() {
+            return Err(BeanStreamError::InvalidConfiguration(
+                "Certificate pinning requires the 'rustls-tls' feature".to_string(),
+            ));
         }
 
         client.build().map_err(Into::into)
@@ -251,6 +290,13 @@ impl HttpClientBuilder {
                 request.interceptors = self.interceptors.clone();
             }
 
+            // P2-2: the jar is shared by reference, so a login request and the
+            // calls after it keep the same session.
+            #[cfg(feature = "cookies")]
+            if let Some(jar) = &self.cookie_jar {
+                request.cookie_jar = Some(jar.clone());
+            }
+
             // Default headers are validated at add_default_header() time.
             request.headers.extend(self.default_headers.iter().cloned());
 
@@ -324,11 +370,24 @@ mod tests {
         assert!(matches!(result, Err(BeanStreamError::MissingConfig(_))));
     }
 
+    // Pinning needs reqwest's rustls backend to install a preconfigured TLS
+    // config, so with `rustls-tls` off the failure is expected.
+    #[cfg(feature = "rustls-tls")]
     #[test]
     fn builds_a_client_with_certificate_pinning() {
         let config = CertPinConfig::new().pin_spki_sha256([0x11; 32]);
         let builder = HttpClientBuilder::default().with_cert_pinning(config);
         assert!(builder.build().is_ok());
+    }
+
+    #[cfg(not(feature = "rustls-tls"))]
+    #[test]
+    fn cert_pinning_without_tls_build_is_refused() {
+        let config = CertPinConfig::new().pin_spki_sha256([0x11; 32]);
+        assert!(HttpClientBuilder::default()
+            .with_cert_pinning(config)
+            .build()
+            .is_err());
     }
 
     #[test]

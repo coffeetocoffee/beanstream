@@ -2,27 +2,45 @@
 name = "beanstream"
 version = "0.1.0"
 edition = "2021"
+description = "Security-first HTTP client: SSRF-safe URL validation, header sanitization, and response redaction"
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+keywords = ["http", "client", "security", "ssrf"]
+categories = ["network-programming", "web-programming::http-client"]
+repository = "https://github.com/coffeetocoffee/beanstream"
 
 [dependencies]
-reqwest = { version = "0.12", features = ["json", "rustls-tls", "stream"] }
+# `default-features = false` so the crate chooses its TLS stack through the
+# `rustls-tls` feature instead of silently inheriting native-tls.
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream"] }
 tokio = { version = "1.35", features = ["full"] }
 url = "2.5"
 ipnet = "2.9"
 backoff = { version = "0.4", features = ["tokio"] }
 dashmap = "5.5"
-serde = { version = "1.0", features = ["derive"] }
 thiserror = "1.0"
 futures-util = "0.3"
 bytes = "1"
 sha2 = "0.10"
 base64 = "0.22"
 rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
+# Re-exported through the public cert-pinning API (CertificateDer, ServerName),
+# so this is a real dependency rather than an implementation detail.
 rustls-pki-types = "1"
 webpki-roots = "1"
 tokio-tungstenite = { version = "0.26", optional = true, features = ["rustls-tls-webpki-roots"] }
 
 [features]
-default = []
+default = ["http2", "rustls-tls"]
+# HTTP/2 support (h2). On by default.
+http2 = ["reqwest/http2"]
+# Cookie jar: persistent, per-origin cookie storage across requests. Opt-in,
+# because an always-on jar would let one host's Set-Cookie ride along to
+# unrelated later requests. See `CookieJar` and
+# `HttpClientBuilder::with_cookie_jar`.
+cookies = ["reqwest/cookies"]
+# TLS via rustls with webpki roots, rather than the platform's native stack.
+rustls-tls = ["reqwest/rustls-tls"]
 websocket = ["dep:tokio-tungstenite"]
 
 [dev-dependencies]

@@ -80,6 +80,9 @@ pub struct HttpRequest {
     pub cache: Option<Arc<InMemoryCache>>,
     pub rate_limiter: Option<RateLimiter>,
     pub interceptors: InterceptorChain,
+    /// Shared cookie jar, only meaningful with the `cookies` feature (P2-2).
+    #[cfg(feature = "cookies")]
+    pub cookie_jar: Option<crate::cookies::CookieJar>,
     progress: Option<Arc<dyn UploadProgress>>,
 }
 
@@ -104,7 +107,6 @@ impl std::fmt::Debug for HttpRequest {
             .finish()
     }
 }
-
 impl Clone for HttpRequest {
     fn clone(&self) -> Self {
         Self {
@@ -121,6 +123,8 @@ impl Clone for HttpRequest {
             cache: self.cache.clone(),
             rate_limiter: self.rate_limiter.clone(),
             interceptors: self.interceptors.clone(),
+            #[cfg(feature = "cookies")]
+            cookie_jar: self.cookie_jar.clone(),
             progress: self.progress.clone(),
         }
     }
@@ -166,6 +170,8 @@ impl HttpRequest {
             cache: None,
             rate_limiter: None,
             interceptors: InterceptorChain::new(),
+            #[cfg(feature = "cookies")]
+            cookie_jar: None,
             progress: None,
         })
     }
@@ -352,6 +358,16 @@ impl HttpRequest {
 
         if let Some((host, addresses)) = pinned {
             builder = builder.resolve_to_addrs(host, addresses);
+        }
+
+        // P2-2: cookies are opt-in. When a jar is attached, reqwest stores
+        // Set-Cookie per origin and replays Cookie on later requests -- but
+        // only through this pinned client, so validation still applies.
+        #[cfg(feature = "cookies")]
+        if let Some(jar) = &self.cookie_jar {
+            if let Some(store) = jar.provider() {
+                builder = builder.cookie_provider(store);
+            }
         }
 
         builder.build().map_err(Into::into)

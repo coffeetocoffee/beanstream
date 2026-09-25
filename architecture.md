@@ -534,7 +534,14 @@ mod tests {
     fn test_url_validation_blocks_private_ips() {
         assert!(validate_url("http://192.168.1.1/test").is_err());
         assert!(validate_url("http://10.0.0.1/admin").is_err());
-        assert!(validate_url("http://127.0.0.1/api").is_ok()); // localhost OK
+
+        // Loopback is private too, so it is rejected like any other
+        // internal address -- there is no "localhost is fine" exception.
+        assert!(validate_url("http://127.0.0.1/api").is_err());
+        assert!(validate_url("http://localhost/api").is_err());
+
+        // Public addresses are the only ones that pass.
+        assert!(validate_url("https://8.8.8.8/api").is_ok());
     }
     
     #[test]
@@ -543,18 +550,28 @@ mod tests {
         assert!(sanitize_header("name", "safe-value").is_ok());
     }
     
-    #[test]
-    fn test_abort_cancellation_works() {
-        let (controller, handle) = create_abort_signal();
+    #[tokio::test]
+    async fn test_abort_cancellation_works() {
+        let (controller, signal) = create_abort_signal();
+        let request = HttpRequest::get("https://8.8.8.8/").unwrap();
         let task = tokio::spawn(async move {
-            execute_with_abort(request, handle).await
+            execute_with_abort(request, signal).await
         });
         
         controller.abort();
-        assert!(task.await.unwrap().is_err());
+        assert!(matches!(task.await.unwrap(), Err(BeanStreamError::RequestAborted)));
     }
 }
 ```
+
+> **Note on the loopback example above:** an earlier draft of this document
+> asserted `validate_url("http://127.0.0.1/api").is_ok()` with the comment
+> "localhost OK". That was wrong, and it contradicted the code, which has
+> always returned `PrivateNetworkAccess` for loopback. The example now matches
+> the implementation: `127.0.0.1`, `localhost`, `*.local` and `*.internal` are
+> all rejected. Callers who genuinely need to reach an internal host opt in
+> explicitly via `HttpClientBuilder::allow_private_networks()`, which is a
+> deliberate, visible decision rather than a default.
 
 #### Integration Test Scenarios
 
