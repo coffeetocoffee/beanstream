@@ -9,5 +9,6 @@ tokio = { version = "1.35", features = ["full"] }
 url = "2.5"
 ipnet = "2.9"
 backoff = { version = "0.4", features = ["tokio"] }
+dashmap = "5.5"
 serde = { version = "1.0", features = ["derive"] }
 thiserror = "1.0"
