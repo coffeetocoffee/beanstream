@@ -44,8 +44,18 @@ fn websocket_target_for_validation(url: &str) -> String {
 /// The host is resolved asynchronously and every resolved address is checked
 /// against the private/reserved block list; the connection is then made to one
 /// of those validated addresses rather than letting the driver resolve the name
-/// again. Certificate pinning is not currently plumbed into the WebSocket TLS
-/// handshake.
+/// again.
+///
+/// Two limitations to know about, both deliberate:
+///
+/// - **The proxy configuration is not applied here.** A WebSocket through an
+///   HTTP proxy needs a `CONNECT` upgrade that `tokio-tungstenite` does not
+///   perform, so `ProxyConfig` affects HTTP paths only. A `wss://` connection
+///   goes direct. If you need a proxied socket, terminate it yourself and hand
+///   the stream over.
+/// - **Certificate pinning is not applied to the TLS handshake either**, for the
+///   same reason — the handshake is driven by the WebSocket stack, not by
+///   reqwest's client configuration.
 ///
 /// The returned [`WebSocket`] implements `Stream<Item = Message>` and
 /// `Sink<Message>` from the `futures` ecosystem.

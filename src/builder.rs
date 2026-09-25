@@ -7,6 +7,7 @@ use url::Url;
 use crate::cert_pinning::CertPinConfig;
 use crate::header_validation::{is_blocked_header, sanitize_header};
 use crate::interceptor::InterceptorChain;
+use crate::proxy_config::ProxyConfig;
 use crate::redirect_policy::{RedirectPolicy, ScopeValidator};
 use crate::request_handler::{HttpRequest, HttpResponse};
 use crate::{BeanStreamError, Result};
@@ -53,6 +54,7 @@ pub struct HttpClientBuilder {
     default_headers: Vec<(String, String)>,
     check_private_ips: bool,
     cert_pinning: Option<CertPinConfig>,
+    proxy: ProxyConfig,
     interceptors: InterceptorChain,
     #[cfg(feature = "cookies")]
     cookie_jar: Option<crate::cookies::CookieJar>,
@@ -70,6 +72,9 @@ impl Default for HttpClientBuilder {
             default_headers: Vec::new(),
             check_private_ips: true,
             cert_pinning: None,
+            // Matches reqwest and curl: honour the environment and the platform's
+            // proxy settings unless told otherwise.
+            proxy: ProxyConfig::default(),
             interceptors: InterceptorChain::new(),
             #[cfg(feature = "cookies")]
             cookie_jar: None,
@@ -154,6 +159,23 @@ impl HttpClientBuilder {
     /// target internal hosts. It is applied to requests created by
     /// [`HttpClientBuilder::create_request`]; previously the flag was stored but
     /// never read, so it silently did nothing.
+    /// Opt out of private-network blocking for this client.
+    ///
+    /// This **weakens SSRF protection** and exists for clients that legitimately
+    /// target internal hosts. It relaxes two things on requests created by
+    /// [`HttpClientBuilder::create_request`]: the reserved-name deny list
+    /// (`localhost`, `*.local`, …) and the check on the destination's *resolved*
+    /// addresses. Both were needed — relaxing only the name list left a hostname
+    /// that resolves privately still refused, so the opt-in looked like it did
+    /// nothing.
+    ///
+    /// It does **not** make a literal private address reachable:
+    /// [`HttpRequest::new`](crate::HttpRequest::new) calls
+    /// [`validate_url`](crate::validate_url), which refuses `https://127.0.0.1/`
+    /// and `http://10.0.0.1/` outright, before this client's configuration is
+    /// consulted. To reach such an address, build the request against a public
+    /// URL and retarget it, or use [`Self::build`] and manage the connection
+    /// yourself.
     pub fn allow_private_networks(mut self) -> Self {
         self.check_private_ips = false;
         self
@@ -188,6 +210,56 @@ impl HttpClientBuilder {
     pub fn with_cert_pinning(mut self, config: CertPinConfig) -> Self {
         self.cert_pinning = Some(config);
         self
+    }
+
+    /// Choose how requests reach a proxy (A1-A4).
+    ///
+    /// The default is [`ProxyConfig::System`], which matches reqwest and curl:
+    /// the conventional environment variables are read, plus the platform's own
+    /// proxy settings on macOS (CFNetwork) and Windows (registry) when the
+    /// `system-proxy` feature is on — it is on by default.
+    ///
+    /// Use [`ProxyConfig::Explicit`] for a fixed proxy,
+    /// [`ProxyConfig::Environment`] for the variables only (predictable in
+    /// containers and CI), or [`ProxyConfig::Disabled`] to ignore both.
+    ///
+    /// **Read the [`proxy_config`](crate::ProxyConfig) module docs before
+    /// enabling this.** With a proxy, the client connects to the proxy and the
+    /// proxy resolves the destination, so address-level private-IP checks can no
+    /// longer cover the destination — the proxy becomes the trust boundary.
+    /// Static checks (literal private IPs, and `localhost`/`*.local`/`*.internal`
+    /// by name) still apply.
+    ///
+    /// ```
+    /// use beanstream::{HttpClientBuilder, ProxyConfig};
+    ///
+    /// let builder = HttpClientBuilder::default()
+    ///     .with_proxy(ProxyConfig::explicit("http://proxy.corp.example:3128")?);
+    ///
+    /// // Or refuse proxying outright, whatever the environment says.
+    /// let direct = HttpClientBuilder::default().with_proxy(ProxyConfig::Disabled);
+    /// # Ok::<(), beanstream::BeanStreamError>(())
+    /// ```
+    pub fn with_proxy(mut self, proxy: ProxyConfig) -> Self {
+        self.proxy = proxy;
+        self
+    }
+
+    /// The proxy configuration this builder will use.
+    pub fn proxy(&self) -> &ProxyConfig {
+        &self.proxy
+    }
+
+    /// Apply this builder's proxy configuration to a `reqwest` client builder.
+    ///
+    /// Delegates to [`crate::proxy_config::apply`], which both this and the
+    /// pinned send path use — the two clients must agree, or a builder setting
+    /// would be silently ignored by `send()`.
+    pub(crate) fn apply_proxy(
+        &self,
+        client: reqwest::ClientBuilder,
+    ) -> Result<reqwest::ClientBuilder> {
+        crate::proxy_config::apply(client, &self.proxy)
     }
 
     /// Register middleware applied to every request created by this builder
@@ -245,6 +317,10 @@ impl HttpClientBuilder {
                 client = client.cookie_provider(store);
             }
         }
+
+        // A1-A4: proxy routing. Applied before pinning so the TLS config and the
+        // proxy hop compose in the obvious order.
+        client = self.apply_proxy(client)?;
 
         // P2-2: pinning needs reqwest's rustls backend to install a
         // preconfigured TLS config. Refuse loudly rather than build a client
@@ -372,6 +448,16 @@ impl HttpClientBuilder {
                 request.cert_pinning = Some(pinning.clone());
             }
 
+            // Same reasoning for the proxy: the pinned send path builds its own
+            // client, so the routing decision has to travel on the request or it
+            // is silently ignored there.
+            request.proxy = self.proxy.clone();
+
+            // `allow_private_networks()` has to reach the address check too, not
+            // just the scope validator below, or a hostname resolving privately
+            // stays refused and the opt-in appears inert.
+            request.allow_private_addresses = !self.check_private_ips;
+
             // Default headers are validated at add_default_header() time.
             request.headers.extend(self.default_headers.iter().cloned());
 
@@ -397,6 +483,13 @@ impl HttpClientBuilder {
                     "*.local",
                     "*.internal",
                 ]);
+            } else {
+                // `allow_private_networks()` must also relax the *address* check,
+                // not just the name-based deny list. Otherwise a hostname that
+                // resolves to a private address still fails in `resolve_pin`, so
+                // the opt-in would appear to do nothing for the case it exists
+                // for.
+                request.scope_validator = ScopeValidator::new(false);
             }
 
             request
@@ -524,6 +617,100 @@ mod tests {
             .add_interceptor(Arc::new(AuthInterceptor::new("token")));
         let request = builder.create_request(Method::GET, "users").unwrap();
         assert_eq!(request.interceptors.len(), 1);
+    }
+
+    // --- A1-A4: proxy configuration reaches both clients ---
+
+    #[test]
+    fn the_builders_proxy_choice_reaches_created_requests() {
+        // Same defect shape as the certificate pins: the pinned send path builds
+        // its own client, so a routing decision that stayed on the builder would
+        // be ignored by send(). The default must also be the documented one.
+        let default_builder = HttpClientBuilder::default();
+        let default_request = default_builder
+            .with_base_url("https://8.8.8.8/")
+            .create_request(Method::GET, "users")
+            .unwrap();
+        assert_eq!(
+            default_request.proxy,
+            crate::proxy_config::ProxyConfig::System,
+            "the default follows reqwest and curl"
+        );
+
+        let explicit =
+            crate::proxy_config::ProxyConfig::explicit("http://proxy.corp.example:3128").unwrap();
+        let request = HttpClientBuilder::default()
+            .with_base_url("https://8.8.8.8/")
+            .with_proxy(explicit.clone())
+            .create_request(Method::GET, "users")
+            .unwrap();
+        assert_eq!(request.proxy, explicit);
+    }
+
+    #[test]
+    fn allow_private_networks_reaches_the_address_check_too() {
+        // Relaxing only the reserved-name deny list left a hostname that
+        // resolves privately still refused, so the opt-in appeared inert for
+        // exactly the case it exists for.
+        let blocked = HttpClientBuilder::default()
+            .with_base_url("https://8.8.8.8/")
+            .create_request(Method::GET, "users")
+            .unwrap();
+        assert!(!blocked.allow_private_addresses);
+
+        let allowed = HttpClientBuilder::default()
+            .with_base_url("https://8.8.8.8/")
+            .allow_private_networks()
+            .create_request(Method::GET, "users")
+            .unwrap();
+        assert!(allowed.allow_private_addresses);
+    }
+
+    #[test]
+    fn proxy_mode_is_reported_back() {
+        assert_eq!(
+            HttpClientBuilder::default().proxy(),
+            &crate::proxy_config::ProxyConfig::System
+        );
+        assert_eq!(
+            HttpClientBuilder::default()
+                .with_proxy(crate::proxy_config::ProxyConfig::Disabled)
+                .proxy(),
+            &crate::proxy_config::ProxyConfig::Disabled
+        );
+    }
+
+    #[test]
+    fn every_proxy_mode_applies_to_a_client_builder() {
+        // `apply_proxy` is shared by the builder and the pinned path, so a
+        // failure here would affect both. All four modes must produce a client.
+        let explicit =
+            crate::proxy_config::ProxyConfig::explicit("http://proxy.example:3128").unwrap();
+        let with_auth = crate::proxy_config::ProxyConfig::explicit_with_auth(
+            "http://proxy.example:3128",
+            "u",
+            "p",
+        )
+        .unwrap();
+
+        for config in [
+            crate::proxy_config::ProxyConfig::System,
+            crate::proxy_config::ProxyConfig::Environment,
+            crate::proxy_config::ProxyConfig::Disabled,
+            explicit,
+            with_auth,
+        ] {
+            let applied = crate::proxy_config::apply(reqwest::Client::builder(), &config);
+            assert!(
+                applied.is_ok(),
+                "mode {config:?} must apply cleanly: {:?}",
+                applied.err()
+            );
+            assert!(
+                applied.unwrap().build().is_ok(),
+                "mode {config:?} must produce a usable client"
+            );
+        }
     }
 
     #[test]

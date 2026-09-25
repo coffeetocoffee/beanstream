@@ -601,24 +601,97 @@ Ensure flawless operation everywhere:
 - ✅ iOS ATS configuration generation
 - ✅ Android network security config
 - ✅ Certificate pinning implementation
-- ⬜ Native proxy integration — **not implemented**
+- ✅ Native proxy integration
 
 #### Week 6: Desktop & Systems
-- ⬜ Linux environment variable proxy support — **not implemented**
-- ⬜ macOS CFNetwork proxy integration — **not implemented**
-- ⬜ Windows system proxy detection — **not implemented**
+- ✅ Linux environment variable proxy support
+- ✅ macOS CFNetwork proxy integration
+- ✅ Windows system proxy detection
 - ⚠️ Cross-platform test suite — CI covers Linux, Windows and macOS (see
   [Continuous Integration](#continuous-integration)), but the tests are
   network-free, so no platform's *real* network stack behaviour is exercised
 
-> **Correction (proxy support).** These four items were previously marked ✅.
-> They are not implemented: `grep -ri proxy src/` returns nothing, there is no
-> `Proxy` type, no environment-variable handling, and nothing in `Cargo.toml`
-> enables reqwest's proxy support. A proxy would also need a decision this crate
-> has not made — whether proxy resolving should bypass the private-address
-> checks — so it is listed as open work rather than a checkbox. If you need a
-> proxy today, reqwest's own configuration is the way, and it must be applied to
-> a client you build yourself.
+### Proxy support
+
+Implemented in `src/proxy_config.rs` and wired through every send path. Four
+modes, made explicit rather than implicit:
+
+| Mode | Source | Platforms |
+|------|--------|-----------|
+| `ProxyConfig::System` *(default)* | environment **and** platform settings | macOS CFNetwork / System Configuration, Windows registry |
+| `ProxyConfig::Environment` | environment variables only | none — portable |
+| `ProxyConfig::Explicit(url)` | one URL you supply | none |
+| `ProxyConfig::Disabled` | never | none |
+
+The `System` / `Environment` split is the reason both exist: `System` picks up a
+proxy configured in macOS Network preferences or the Windows registry, which
+`Environment` deliberately does not. On Linux there is nothing but the
+environment, so they behave identically there.
+
+```rust
+use beanstream::{HttpClientBuilder, HttpRequest, ProxyConfig};
+
+// A fixed proxy.
+let client = HttpClientBuilder::default()
+    .with_proxy(ProxyConfig::explicit("http://proxy.corp.example:3128")?);
+
+// Credentials supplied separately, so no password-bearing URL has to exist.
+let authenticated = ProxyConfig::explicit_with_auth(
+    "http://proxy.corp.example:3128",
+    "user",
+    "secret",
+)?;
+
+// Refuse proxying whatever the environment says.
+let direct = HttpClientBuilder::default().with_proxy(ProxyConfig::Disabled);
+
+// Per request, too.
+let request = HttpRequest::get("https://api.example.com/data")?
+    .with_proxy(ProxyConfig::Disabled);
+# Ok::<(), beanstream::BeanStreamError>(())
+```
+
+Variables, most specific first, matching curl: `ALL_PROXY` / `all_proxy`,
+`HTTPS_PROXY` / `https_proxy`, `HTTP_PROXY` / `http_proxy`, and `NO_PROXY` /
+`no_proxy` as a comma-separated bypass list (hostnames matching subdomains, IPs,
+CIDR ranges, or `*`). `NO_PROXY` is honoured in every mode that can proxy, and
+also for an explicit proxy — a bypass list is a statement that some hosts must be
+reached directly.
+
+Requires the `system-proxy` feature (on by default) for the platform-specific
+lookups. Without it, `System` degrades to `Environment`.
+
+#### What a proxy does *not* change
+
+This is the part worth being precise about, because the usual worry is that a
+proxy moves the security checks out of your control — the client talks to the
+proxy, the proxy resolves the origin, and your private-IP block list never sees
+the real address. That is not how this works:
+
+- **The destination is still resolved and validated locally, proxy or not.**
+  Every resolved address is checked against the private/reserved block list
+  before the request is sent, so a proxy cannot be used to reach an internal
+  service that a direct request would refuse. There is a test for exactly this:
+  with a proxy configured, `http://169.254.169.254/…` is refused and the proxy is
+  never contacted.
+- Literal private addresses, and `localhost` / `*.local` / `*.internal` by name,
+  are refused even earlier by `validate_url`.
+- The trade-off this creates: a proxy that exists *because* it can resolve
+  internal names will not help you, since the name is resolved here. Reaching an
+  internal host still requires the explicit
+  `HttpClientBuilder::allow_private_networks()` opt-in. That asymmetry is
+  deliberate — the alternative is that setting one environment variable silently
+  disables the SSRF protection the crate is built around.
+
+What a proxy *does* change is egress: traffic leaves through a host you
+configured, and that host can see the request (and, for plain `http://`
+destinations, its contents). So configure one only if you trust it, and note that
+`System` reads the environment and the OS — inputs anyone with access to those
+settings can change.
+
+Known limitation: the proxy is not applied to WebSocket connections. A `wss://`
+through an HTTP proxy needs a `CONNECT` upgrade that `tokio-tungstenite` does not
+perform, so `connect_websocket` goes direct.
 
 ---
 
@@ -707,25 +780,26 @@ This is not a target stated in prose — it is produced by `cargo llvm-cov` on
 every push (see `.github/workflows/ci.yml`), which fails the build if line
 coverage drops below **80%**.
 
-Measured on 2026-09-25 with `cargo llvm-cov --all-features --workspace`:
+Measured on 2026-09-25 (v1.0.0) with `cargo llvm-cov --all-features --workspace`:
 
 | Scope | Line coverage | Lines hit / total |
 |-------|---------------|-------------------|
-| **crate total** | **85.8%** | 3149 / 3671 |
+| **crate total** | **86.5%** | 3482 / 4025 |
 | `header_validation.rs` | 99.2% | 126 / 127 |
 | `platform_config.rs` | 98.8% | 164 / 166 |
 | `retry.rs` | 98.6% | 71 / 72 |
-| `redirect_policy.rs` | 94.6% | 295 / 312 |
 | `rate_limit.rs` | 94.4% | 67 / 71 |
+| `redirect_policy.rs` | 94.6% | 295 / 312 |
+| `proxy_config.rs` | 92.8% | 233 / 251 |
 | `cache.rs` | 92.1% | 198 / 215 |
 | `progress.rs` | 89.7% | 26 / 29 |
+| `builder.rs` | 89.2% | 363 / 407 |
 | `url_validation.rs` | 86.9% | 359 / 413 |
-| `request_handler.rs` | 86.7% | 987 / 1138 |
-| `builder.rs` | 85.4% | 275 / 322 |
+| `request_handler.rs` | 86.5% | 999 / 1155 |
 | `cookies.rs` | 84.8% | 28 / 33 |
 | `interceptor.rs` | 81.9% | 104 / 127 |
 | `cert_pinning.rs` | 74.1% | 183 / 247 |
-| `streaming.rs` | 72.1% | 129 / 179 |
+| `streaming.rs` | 71.7% | 129 / 180 |
 | `websocket.rs` | 66.0% | 68 / 103 |
 | `abort.rs` | 62.9% | 66 / 105 |
 | `error_handling_impl.rs` | 25.0% | 3 / 12 |
@@ -737,7 +811,7 @@ cargo llvm-cov --all-features --workspace --summary-only
 cargo llvm-cov report --fail-under-lines 80   # what CI enforces
 ```
 
-The document's other examples are executable too: `cargo test --doc` runs 15
+The document's other examples are executable too: `cargo test --doc` runs 18
 doctests drawn from this crate's rustdoc, on every feature combination
 (`cargo test --doc`, `--all-features`, `--no-default-features`).
 
@@ -886,11 +960,12 @@ tracked work, not marketing.
 
 | Item | State | Evidence |
 |------|-------|----------|
-| All tests passing | ✅ | 109 unit + 9 API-path + 5 behaviour + 15 doctests on default features; 114 + 9 + 6 + 15 with `--all-features`. Enforced by CI. |
+| All tests passing | ✅ | 141 unit + 8 proxy-routing + 9 API-path + 5 behaviour + 18 doctests on default features. Enforced by CI. |
 | Coverage measured and floored | ✅ | 85.3% lines, CI fails under 80% (see [Measured Coverage](#measured-coverage)). |
 | Documented import paths compile | ✅ | `tests/documented_api_paths.rs` imports the crate exactly as README.md shows, so a private-module path breaks the build (P2-7). |
 | Public API documented (rustdoc) | ✅ | `#![warn(missing_docs)]` on the crate root; 169 previously undocumented public items now have docs, and 15 doctests exercise the examples (P3-3). CI fails on any missing doc. |
-| Security audit completed | ✅ | `BeanStream_weaknesses.txt`; P0, P1, P2 and P3 all closed. |
+| Proxy support (platform + env) | ✅ | `src/proxy_config.rs`; `system-proxy` feature on by default. Covered by `tests/proxy_routing.rs` (8 tests) and 15 unit tests. |
+| Security audit completed | ✅ | `BeanStream_weaknesses.txt`; P0, P1, P2, P3 and W-1..W-4 all closed. |
 | Lints and formatting enforced | ✅ | CI runs `cargo fmt --check` and `cargo clippy --all-targets -- -D warnings` on default, all and no-default features. |
 | Docs build warning-free | ✅ | CI runs `cargo doc --no-deps --all-features` with `RUSTDOCFLAGS=-D warnings`, plus `cargo test --doc`. Verified clean on default, all and no-default features. |
 | Performance benchmarks within targets | ⬜ | No benchmark suite and no measured targets yet. |

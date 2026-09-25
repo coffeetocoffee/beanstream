@@ -74,6 +74,7 @@
 //! | `http2` | yes | Enables HTTP/2 via re-exported [`reqwest`] support |
 //! | `rustls-tls` | yes | TLS via `rustls` with webpki roots. **Required for `CertPinConfig`**: without it, building a client with pinning returns [`BeanStreamError::InvalidConfiguration`] rather than silently producing an unpinned client |
 //! | `cookies` | no | Enables `CookieJar` for per-origin session storage. Opt-in, because an always-on jar lets one host's `Set-Cookie` ride along to unrelated later requests |
+//! | `system-proxy` | yes | Lets [`ProxyConfig::System`] read the platform's proxy settings (macOS CFNetwork, Windows registry) in addition to the environment. Without it, `System` degrades to [`ProxyConfig::Environment`] |
 //! | `websocket` | no | Enables `connect_websocket` via `tokio-tungstenite` |
 //!
 //! # Security model, stated plainly
@@ -106,13 +107,32 @@
 //!   header set, so neither a direct push onto the public `headers` field nor
 //!   an interceptor can smuggle one past the guard that
 //!   [`HttpRequest::add_header`] applies.
+//! - **A proxy does not weaken the address checks.** The destination is
+//!   resolved and validated locally whether or not a proxy is configured, so a
+//!   proxy cannot be used to reach an internal service that a direct request
+//!   would refuse. See [`ProxyConfig`], and note the corollary: a proxy that
+//!   exists *because* it can resolve internal names will not help, since the
+//!   name is resolved here. Reaching an internal host requires the explicit
+//!   [`HttpClientBuilder::allow_private_networks`] opt-in.
+//!
+//! # Proxy support
+//!
+//! [`ProxyConfig`] chooses how requests egress: [`ProxyConfig::System`]
+//! (the default, matching reqwest and curl) reads the environment and, with the
+//! `system-proxy` feature on — as it is by default — the platform's settings on
+//! macOS (CFNetwork) and Windows (registry). [`ProxyConfig::Environment`] reads
+//! the variables only, [`ProxyConfig::Explicit`] pins one proxy, and
+//! [`ProxyConfig::Disabled`] refuses proxying outright. `NO_PROXY` is honoured
+//! as a bypass list in every mode that can proxy.
 //!
 //! # What is not implemented
 //!
-//! Stated here rather than left to be discovered: there is **no proxy
-//! support** (no `Proxy` type, no environment-variable handling), no benchmark
-//! suite, and no JavaScript/TypeScript bridge. [`CertPinConfig`] applies to
-//! HTTP and to [`download_stream`], but **not** to the WebSocket TLS handshake.
+//! Stated here rather than left to be discovered: no benchmark suite, and no
+//! JavaScript/TypeScript bridge. Two narrower gaps are worth naming:
+//! [`CertPinConfig`] applies to HTTP and to [`download_stream`] but **not** to
+//! the WebSocket TLS handshake, and [`ProxyConfig`] is **not** applied to
+//! WebSocket connections either — a `wss://` through an HTTP proxy needs a
+//! `CONNECT` upgrade that the WebSocket stack does not perform.
 //!
 //! See `architecture.md` in the repository for the full threat model and
 //! per-module coverage table.
@@ -137,6 +157,7 @@ mod header_validation;
 mod interceptor;
 mod platform_config;
 mod progress;
+mod proxy_config;
 mod rate_limit;
 mod redirect_policy;
 mod request_handler;
@@ -162,6 +183,7 @@ pub use header_validation::{
 pub use interceptor::{AuthInterceptor, Interceptor, InterceptorChain, LoggingInterceptor};
 pub use platform_config::{generate_android_network_config, generate_ios_plist, AtsException};
 pub use progress::{NoopProgress, UploadProgress};
+pub use proxy_config::{ProxyConfig, ProxyEndpoint};
 pub use rate_limit::{RateLimitGuard, RateLimiter};
 pub use redirect_policy::{RedirectPolicy, ScopeValidator};
 pub use request_handler::{HttpRequest, HttpResponse};

@@ -119,6 +119,10 @@ pub async fn download_stream(request: &HttpRequest) -> Result<ByteStream> {
         ));
     }
 
+    // A1-A4: proxy routing, through the same helper as every other send path so
+    // streaming cannot disagree with a plain request about egress.
+    client = crate::proxy_config::apply(client, &prepared.proxy)?;
+
     let client = client.build()?;
 
     let mut outbound = client.request(prepared.method.clone(), &prepared.url);

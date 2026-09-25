@@ -1,6 +1,6 @@
 [package]
 name = "beanstream"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
 description = "Security-first HTTP client: SSRF-safe URL validation, header sanitization, and response redaction"
 license = "MIT OR Apache-2.0"
@@ -31,7 +31,7 @@ webpki-roots = "1"
 tokio-tungstenite = { version = "0.26", optional = true, features = ["rustls-tls-webpki-roots"] }
 
 [features]
-default = ["http2", "rustls-tls"]
+default = ["http2", "rustls-tls", "system-proxy"]
 # HTTP/2 support (h2). On by default.
 http2 = ["reqwest/http2"]
 # Cookie jar: persistent, per-origin cookie storage across requests. Opt-in,
@@ -41,6 +41,11 @@ http2 = ["reqwest/http2"]
 cookies = ["reqwest/cookies"]
 # TLS via rustls with webpki roots, rather than the platform's native stack.
 rustls-tls = ["reqwest/rustls-tls"]
+# Proxy support (A1-A4). Enables reading the platform's proxy settings on macOS
+# (CFNetwork / System Configuration) and Windows (registry), in addition to the
+# standard proxy environment variables. Without it, only the environment is
+# consulted, and `ProxyConfig::System` degrades to `Environment`.
+system-proxy = ["reqwest/system-proxy"]
 websocket = ["dep:tokio-tungstenite"]
 
 [dev-dependencies]

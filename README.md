@@ -68,7 +68,50 @@ assert!(is_sensitive_header("SET-COOKIE"));
 assert!(!is_sensitive_header("content-type"));
 ```
 
-### 4. Intelligent Redirect Handling
+### 4. Proxy Support
+
+Requests can egress through a proxy, and the choice is explicit rather than
+implicit:
+
+```rust
+use beanstream::{HttpClientBuilder, ProxyConfig};
+
+// A fixed proxy.
+let client = HttpClientBuilder::default()
+    .with_proxy(ProxyConfig::explicit("http://proxy.corp.example:3128")?);
+
+// Or refuse proxying, whatever the environment says.
+let direct = HttpClientBuilder::default().with_proxy(ProxyConfig::Disabled);
+# Ok::<(), beanstream::BeanStreamError>(())
+```
+
+Four modes:
+
+| Mode | Source |
+|------|--------|
+| `ProxyConfig::System` *(default)* | environment **and** platform settings (macOS CFNetwork, Windows registry) |
+| `ProxyConfig::Environment` | environment variables only — portable and predictable |
+| `ProxyConfig::Explicit(url)` | one URL you supply, with optional credentials |
+| `ProxyConfig::Disabled` | never |
+
+Variables, most specific first, matching curl: `ALL_PROXY`, `HTTPS_PROXY`,
+`HTTP_PROXY`, and `NO_PROXY` as a comma-separated bypass list. `NO_PROXY` is
+honoured in every mode that can proxy, including an explicit one.
+
+**A proxy does not weaken SSRF protection.** The destination is still resolved
+and validated locally whether or not a proxy is configured, so a proxy cannot be
+used to reach an internal service a direct request would refuse — with a proxy
+set, `http://169.254.169.254/…` is refused and the proxy is never contacted.
+What a proxy changes is egress: traffic leaves through a host you configured,
+which can see the request. Configure one only if you trust it, and note that
+`System` reads the environment and the OS, which anyone with access to those
+settings can change.
+
+Known limitation: proxying does not apply to WebSocket connections, since a
+`wss://` through an HTTP proxy needs a `CONNECT` upgrade the WebSocket stack does
+not perform.
+
+### 5. Intelligent Redirect Handling
 
 Redirects are tracked and validated against scope policies — stop open-redirect attacks while letting legitimate chains through.
 
@@ -166,6 +209,7 @@ let client = HttpClientBuilder::default()
 | Method | What it does |
 |--------|--------------|
 | `with_base_url(url)` | Set a base URL for relative targets |
+| `with_proxy(cfg)` | Choose how requests reach a proxy (see below) |
 | `with_timeout(d)` | Overall request timeout |
 | `with_connect_timeout(d)` | Connection establishment timeout |
 | `with_max_redirects(n)` | Maximum redirect hops |
@@ -263,8 +307,9 @@ BeanStream rides on `reqwest` with `rustls`, so it compiles and runs cleanly on:
 ## Status
 
 Everything originally listed as a future milestone is implemented and gated in
-CI. The crate version in `Cargo.toml` is still `0.1.0`; the `v0.4.0`–`v0.8.4`
-tags are release markers, so nothing has been published to crates.io.
+CI. The crate version is `1.0.0`. It has not been published to crates.io — the
+`v0.4.0`–`v0.8.4` tags were release markers and `v1.0` is the first versioned
+release.
 
 | Capability | State |
 |-----------|-------|
@@ -276,8 +321,13 @@ tags are release markers, so nothing has been published to crates.io.
 | WebSocket, middleware chain | ✅ implemented (feature-gated) |
 | DNS pinning + SSRF checks on every send path | ✅ implemented |
 | Certificate pinning | ✅ implemented, needs the `rustls-tls` feature |
-| Proxy support | ⬜ not implemented |
+| Proxy support (platform + environment) | ✅ implemented |
 | Benchmarks, licence audit, JS/TS bridge | ⬜ not started |
+
+Two narrower gaps, stated rather than left to be found: certificate pinning and
+proxy configuration both apply to HTTP (including streaming) but **not** to the
+WebSocket TLS handshake, since a `wss://` through an HTTP proxy needs a `CONNECT`
+upgrade the WebSocket stack does not perform.
 
 ---
 
@@ -333,7 +383,7 @@ Every push and pull request runs `.github/workflows/ci.yml` on GitHub Actions:
 | Job | What it covers |
 |-----|----------------|
 | `lint` | `cargo fmt --check` and `cargo clippy --all-targets -- -D warnings`, on default, all and no-default features |
-| `test` | `build` / `test` / `build --release` across 7 entries: default, `--no-default-features`, `--all-features`, `--features cookies,http2,rustls-tls`, `--features websocket`, Windows, macOS |
+| `test` | `build` / `test` / `build --release` across 7 entries: default, `--no-default-features`, `--all-features`, `--features cookies,http2,rustls-tls`, `--features websocket`, Windows, macOS. The Windows and macOS legs are what exercise the platform proxy lookups |
 | `coverage` | `cargo llvm-cov --all-features`, failing the build under **80%** lines |
 | `docs` | `cargo doc` with `RUSTDOCFLAGS=-D warnings`, plus doc tests |
 
@@ -341,13 +391,15 @@ The suite is deliberately **network-free**: DNS cases use the hosts file or the
 reserved `.invalid` TLD, and nothing connects to a socket. CI is therefore
 deterministic and works offline.
 
-Current coverage is **85.3% of lines** (`cargo llvm-cov --all-features
+Current coverage is **86.5% of lines** (`cargo llvm-cov --all-features
 --workspace --summary-only`). The per-module table, including which modules are
 below the floor and why, is in `architecture.md`.
 
 `tests/documented_api_paths.rs` imports the crate exactly the way this README
 does, so if an example here stops compiling, CI fails rather than the reader
-finding out.
+finding out. `tests/proxy_routing.rs` verifies the four proxy modes against a
+local stand-in, including that a private address is still refused with a proxy
+configured.
 
 ---
 
@@ -359,7 +411,7 @@ BeanStream is licensed under the **MIT** or **Apache-2.0** licenses, at your opt
 
 **Project Name:** BeanStream  
 **Tagline:** *"From bean to bit — pure delivery"*  
-**Version:** 0.1.0  
+**Version:** 1.0.0  
 **License:** MIT/Apache-2.0
 
 *Like the perfect cup of coffee, BeanStream is crafted with care, attention to detail, and respect for every user who interacts with it — pure excellence, every time.* ☕✨

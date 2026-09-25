@@ -150,6 +150,27 @@ pub struct HttpRequest {
     /// [`BeanStreamError::InvalidConfiguration`] rather than connecting
     /// unpinned.
     pub cert_pinning: Option<crate::cert_pinning::CertPinConfig>,
+    /// How this request reaches a proxy (A1-A4).
+    ///
+    /// Carried on the request, not only on the builder, for the same reason as
+    /// the pins: the pinned send path builds its own client, so a routing
+    /// decision left on the builder would be silently ignored there. Defaults to
+    /// [`ProxyConfig::System`](crate::ProxyConfig::System), matching reqwest and
+    /// curl.
+    pub proxy: crate::proxy_config::ProxyConfig,
+    /// Whether the destination's *resolved addresses* may be private.
+    ///
+    /// `false` (the default) means the host is resolved and every address is
+    /// checked against the private/reserved block list before connecting — and
+    /// that holds **even when a proxy is configured**, so a proxy cannot become
+    /// a way to reach internal services a direct request would refuse.
+    ///
+    /// Set by [`HttpClientBuilder::allow_private_networks`](crate::HttpClientBuilder::allow_private_networks),
+    /// which is the explicit opt-in for reaching an internal host. Literal
+    /// private addresses and reserved names are still refused earlier by
+    /// [`validate_url`](crate::validate_url) and by the scope validator, so this
+    /// flag alone does not make `https://127.0.0.1/` reachable.
+    pub allow_private_addresses: bool,
     progress: Option<Arc<dyn UploadProgress>>,
 }
 
@@ -171,6 +192,8 @@ impl std::fmt::Debug for HttpRequest {
             .field("rate_limiter", &self.rate_limiter.is_some())
             .field("interceptors", &self.interceptors.len())
             .field("cert_pinning", &self.cert_pinning.is_some())
+            .field("proxy", &self.proxy)
+            .field("allow_private_addresses", &self.allow_private_addresses)
             .field("has_progress", &self.progress.is_some())
             .finish()
     }
@@ -194,6 +217,8 @@ impl Clone for HttpRequest {
             #[cfg(feature = "cookies")]
             cookie_jar: self.cookie_jar.clone(),
             cert_pinning: self.cert_pinning.clone(),
+            proxy: self.proxy.clone(),
+            allow_private_addresses: self.allow_private_addresses,
             progress: self.progress.clone(),
         }
     }
@@ -253,6 +278,9 @@ impl HttpRequest {
             #[cfg(feature = "cookies")]
             cookie_jar: None,
             cert_pinning: None,
+            // Matches reqwest and curl: platform + environment unless changed.
+            proxy: crate::proxy_config::ProxyConfig::default(),
+            allow_private_addresses: false,
             progress: None,
         })
     }
@@ -375,6 +403,35 @@ impl HttpRequest {
         self
     }
 
+    /// Choose how this request reaches a proxy (A1-A4).
+    ///
+    /// Overrides whatever the builder chose, including its default of
+    /// [`ProxyConfig::System`](crate::ProxyConfig::System). Useful for sending one
+    /// request directly while the rest of the client uses a proxy:
+    ///
+    /// ```
+    /// use beanstream::{HttpRequest, ProxyConfig};
+    ///
+    /// // This one call bypasses any inherited proxy configuration.
+    /// let direct = HttpRequest::get("https://api.example.com/health")?
+    ///     .with_proxy(ProxyConfig::Disabled);
+    /// # Ok::<(), beanstream::BeanStreamError>(())
+    /// ```
+    ///
+    /// Note that a proxy does **not** relax the destination's address checks:
+    /// the host is still resolved and validated locally. See
+    /// [`ProxyConfig`](crate::ProxyConfig) for what a proxy does and does not
+    /// change.
+    pub fn with_proxy(mut self, proxy: crate::proxy_config::ProxyConfig) -> Self {
+        self.proxy = proxy;
+        self
+    }
+
+    /// The proxy configuration this request will use.
+    pub fn proxy(&self) -> &crate::proxy_config::ProxyConfig {
+        &self.proxy
+    }
+
     /// Attach a semaphore-based rate limiter (P0-6).
     ///
     /// Caps in-flight requests and optionally enforces a minimum interval
@@ -468,9 +525,16 @@ impl HttpRequest {
             )));
         }
 
-        for address in &addresses {
-            if crate::url_validation::is_blocked_ip(address) {
-                return Err(BeanStreamError::PrivateNetworkAccess(address.to_string()));
+        // The address check holds even when a proxy is configured. A proxy must
+        // not become a route to internal services that a direct request would
+        // refuse, and the destination is resolved here regardless — so the
+        // decision is about this flag alone, not about whether traffic egresses
+        // through a proxy.
+        if !self.allow_private_addresses {
+            for address in &addresses {
+                if crate::url_validation::is_blocked_ip(address) {
+                    return Err(BeanStreamError::PrivateNetworkAccess(address.to_string()));
+                }
             }
         }
 
@@ -536,6 +600,10 @@ impl HttpRequest {
                 "Certificate pinning requires the 'rustls-tls' feature".to_string(),
             ));
         }
+
+        // A1-A4: proxy routing, applied through the same helper the builder uses
+        // so the two clients cannot disagree.
+        builder = crate::proxy_config::apply(builder, &self.proxy)?;
 
         builder.build().map_err(Into::into)
     }
