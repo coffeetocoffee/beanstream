@@ -403,6 +403,20 @@ mod tests {
             .is_err());
     }
 
+    #[test]
+    fn created_requests_inherit_the_follow_redirects_flag() {
+        // P1-4: the flag must reach the request, because that is what decides
+        // whether send() walks the chain at all.
+        let builder = HttpClientBuilder::default()
+            .with_base_url("https://8.8.8.8/")
+            .with_follow_redirects(true)
+            .with_max_redirects(4);
+        let request = builder.create_request(Method::GET, "users").unwrap();
+
+        assert!(request.redirect_policy.follow_redirects);
+        assert_eq!(request.redirect_policy.max_redirects, 4);
+    }
+
     #[tokio::test]
     async fn builder_send_goes_through_the_pinned_path() {
         // P1-1: the builder's send() must refuse a private-resolving host

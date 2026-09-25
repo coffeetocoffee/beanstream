@@ -82,6 +82,39 @@ assert!(policy.check_redirect(&[], &Url::parse("https://api.example.com/x")?).is
 assert!(policy.check_redirect(&[], &Url::parse("https://evil.com/x")?).is_err());
 ```
 
+`RedirectPolicy::follow_redirects` is what actually drives the send path. It
+defaults to `false`, so a 3xx is handed back to the caller. Set it to `true` and
+`HttpRequest::send` walks the chain itself — it has to, because reqwest's own
+redirect policy is pinned to `none`. Walking it here means every hop gets the
+full treatment:
+
+- re-validated as a fresh URL, so a public start cannot redirect into the
+  private network;
+- re-checked against the redirect policy, scope and scheme rules, so an
+  `https` → `http` downgrade is refused;
+- re-pinned to its own validated addresses, closing the DNS-rebinding window on
+  each hop;
+- loop-checked, and stopped at `max_redirects`.
+
+Method and credentials follow the HTTP rules: 303 always becomes `GET`, and so
+does 301/302 on a `POST` (the body is dropped rather than replayed). A hop that
+changes origin loses its sensitive headers and its body, so credentials cannot
+leak to a second host.
+
+```rust
+use beanstream::redirect_policy::RedirectPolicy;
+use beanstream::request_handler::HttpRequest;
+
+async fn fetch() -> Result<(), Box<dyn std::error::Error>> {
+    let response = HttpRequest::get("https://example.com/start")?
+        .redirect_policy(RedirectPolicy::strict(["example.com"]).follow_redirects(true))
+        .send()
+        .await?;
+    println!("{}", response.status);
+    Ok(())
+}
+```
+
 ---
 
 ## Quick Start

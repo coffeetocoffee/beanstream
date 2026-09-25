@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use reqwest::header::{HeaderName, HeaderValue};
 use reqwest::{Client, Method};
+use url::Url;
 
 use crate::abort::AbortSignal;
 use crate::cache::InMemoryCache;
@@ -15,7 +16,7 @@ use crate::progress::UploadProgress;
 use crate::rate_limit::RateLimiter;
 use crate::redirect_policy::{RedirectPolicy, ScopeValidator};
 use crate::retry::RetryConfig;
-use crate::url_validation::{resolve_host, validate_url, ParsedUrl};
+use crate::url_validation::{resolve_host, validate_url, ParsedUrl, ValidatedHost};
 use crate::{BeanStreamError, Result};
 
 /// Response returned by [`HttpRequest::send`].
@@ -51,6 +52,18 @@ impl HttpResponse {
     pub fn redact(&mut self) {
         self.headers = redact_sensitive_headers(&self.headers);
     }
+}
+
+/// The method, headers and body a redirect hop may carry.
+///
+/// Bundled so [`HttpRequest::plan_hop`] can return the whole hop as one value
+/// instead of a four-element tuple.
+#[derive(Debug, Clone)]
+struct RedirectHop {
+    url: Url,
+    method: Method,
+    headers: Vec<(String, String)>,
+    body: Option<String>,
 }
 
 pub struct HttpRequest {
@@ -285,18 +298,24 @@ impl HttpRequest {
     /// verification from the URL hostname, not the pinned address.
     ///
     /// Returns `None` when the host is a literal IP (nothing to resolve).
-    async fn pinned_addresses(&self) -> Result<Option<(String, Vec<SocketAddr>)>> {
-        let host = &self.parsed_url.host.host;
-
+    ///
+    /// Takes the host explicitly so a redirect hop can be pinned with the same
+    /// guarantees rather than falling back to reqwest's own resolution.
+    async fn resolve_pin(
+        &self,
+        host: &ValidatedHost,
+        port: u16,
+    ) -> Result<Option<(String, Vec<SocketAddr>)>> {
         // Literal IPs need no resolution -- validate_url already checked them.
-        if self.parsed_url.host.ip_addr.is_some() {
+        if host.ip_addr.is_some() {
             return Ok(None);
         }
 
-        let addresses = resolve_host(host).await?;
+        let name = &host.host;
+        let addresses = resolve_host(name).await?;
         if addresses.is_empty() {
             return Err(BeanStreamError::InvalidHost(format!(
-                "Host '{host}' did not resolve to an address"
+                "Host '{name}' did not resolve to an address"
             )));
         }
 
@@ -306,16 +325,26 @@ impl HttpRequest {
             }
         }
 
-        let port = self.parsed_url.port;
         let socket_addresses = addresses
             .iter()
             .map(|address| SocketAddr::new(*address, port))
             .collect::<Vec<_>>();
 
-        Ok(Some((host.clone(), socket_addresses)))
+        Ok(Some((name.clone(), socket_addresses)))
+    }
+
+    /// Pin the request's own hostname/port. See [`HttpRequest::resolve_pin`].
+    async fn pinned_addresses(&self) -> Result<Option<(String, Vec<SocketAddr>)>> {
+        self.resolve_pin(&self.parsed_url.host, self.parsed_url.port)
+            .await
     }
 
     /// Build a reqwest client whose DNS resolution is pinned to `pinned`.
+    ///
+    /// Redirects are always disabled at the reqwest level. When the policy asks
+    /// for redirects to be followed, [`HttpRequest::execute_inner`] walks the
+    /// chain itself so every hop is validated (P1-4); letting reqwest follow
+    /// them would bypass the policy entirely.
     fn build_client(&self, pinned: Option<&(String, Vec<SocketAddr>)>) -> Result<Client> {
         let mut builder = Client::builder()
             .redirect(reqwest::redirect::Policy::none())
@@ -326,6 +355,91 @@ impl HttpRequest {
         }
 
         builder.build().map_err(Into::into)
+    }
+
+    /// Validate one hop of a redirect chain.
+    ///
+    /// Every hop is checked against the redirect policy *and* re-validated as a
+    /// fresh URL, so a redirect cannot be used to reach a private address, a
+    /// forbidden scheme, or a host outside scope (P1-4).
+    fn validate_hop(&self, visited: &[Url], next: &Url) -> Result<()> {
+        self.redirect_policy.check_redirect(visited, next)?;
+        validate_url(next.as_str())?;
+        self.scope_validator.check_url(next.as_str())?;
+        Ok(())
+    }
+
+    /// Plan the next hop of a redirect chain.
+    ///
+    /// Pure: resolves `location` against `current`, rejects loops and policy
+    /// violations, and decides what method/headers/body the hop may carry. Kept
+    /// separate from the network call so the rules are testable without a
+    /// server (P1-4).
+    #[allow(clippy::too_many_arguments)]
+    fn plan_hop(
+        &self,
+        visited: &[Url],
+        current: &Url,
+        status: u16,
+        location: &str,
+        method: &Method,
+        headers: &[(String, String)],
+        body: &Option<String>,
+    ) -> Result<RedirectHop> {
+        let next = current.join(location).map_err(|_| {
+            BeanStreamError::RedirectBlocked(format!("Invalid redirect target '{location}'"))
+        })?;
+
+        if visited.iter().any(|seen| seen == &next) {
+            return Err(BeanStreamError::RedirectBlocked(format!(
+                "Redirect loop detected at '{next}'"
+            )));
+        }
+
+        self.validate_hop(visited, &next)?;
+
+        // 303 always becomes GET; 301/302 do so for POST. Replaying a body on a
+        // rewritten GET would misrepresent the request.
+        let rewrite_to_get =
+            status == 303 || ((status == 301 || status == 302) && *method == Method::POST);
+
+        // A hop to another origin must not carry credentials or a body
+        // addressed to the previous host.
+        let same_origin = current.origin() == next.origin();
+
+        let mut next_method = method.clone();
+        let mut next_body = body.clone();
+        let mut next_headers = headers.to_vec();
+
+        if rewrite_to_get {
+            next_method = Method::GET;
+            next_body = None;
+        }
+
+        if !same_origin {
+            next_headers.retain(|(name, _)| !crate::header_validation::is_sensitive_header(name));
+            next_body = None;
+        }
+
+        Ok(RedirectHop {
+            url: next,
+            method: next_method,
+            headers: next_headers,
+            body: next_body,
+        })
+    }
+
+    /// Extract the `Location` header from a redirect response's headers.
+    fn location_of(headers: &[(String, String)], status: u16) -> Result<&str> {
+        headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("location"))
+            .map(|(_, value)| value.as_str())
+            .ok_or_else(|| {
+                BeanStreamError::RedirectBlocked(format!(
+                    "Redirect response {status} has no Location header"
+                ))
+            })
     }
 
     pub fn build_request(&self) -> Result<reqwest::Request> {
@@ -403,62 +517,21 @@ impl HttpRequest {
         let mut backoff = self.retry.as_ref().map(|r| r.backoff());
         let mut attempt: u32 = 0;
 
-        loop {
+        let outcome = loop {
             attempt += 1;
 
-            match self.send_once(&pinned, conditional_etag.as_deref()).await {
-                Ok((status, headers, body, url)) => {
-                    if let Some(retry) = &self.retry {
-                        if retry.should_retry_status(status) && attempt < max_attempts {
-                            if let Some(backoff) = backoff.as_mut() {
-                                let delay = retry.next_delay(backoff);
-                                tokio::time::sleep(delay).await;
-                            }
-                            continue;
-                        }
-                    }
-
-                    if attempt >= max_attempts {
-                        if status == 429 {
-                            return Err(BeanStreamError::RateLimited);
-                        }
-                        if (500..600).contains(&status) {
-                            return Err(BeanStreamError::ServerError(status));
-                        }
-                    }
-
-                    let mut response = HttpResponse {
-                        status,
-                        headers,
-                        body,
-                        url,
-                    };
-
-                    // P1-3: never surface secrets to the caller.
-                    response.redact();
-
-                    if status == 304 {
-                        if cacheable {
-                            if let Some(cache) = &self.cache {
-                                if let Some(mut hit) = cache.get(self.method.as_str(), &self.url) {
-                                    hit.status = 304;
-                                    response = hit;
-                                }
-                            }
-                        }
-                    } else if cacheable && response.is_success() {
-                        if let Some(cache) = &self.cache {
-                            cache.insert(self.method.as_str(), response.clone());
-                        }
-                    }
-
-                    if !crate::progress::report_complete(&self.progress, response.body.len() as u64)
-                    {
-                        return Err(BeanStreamError::RequestAborted);
-                    }
-
-                    return Ok(response);
-                }
+            match self
+                .send_target(
+                    &pinned,
+                    &self.method,
+                    &self.url,
+                    &self.headers,
+                    self.body.as_deref(),
+                    conditional_etag.as_deref(),
+                )
+                .await
+            {
+                Ok(result) => break Ok(result),
                 Err(err) => {
                     if let Some(retry) = &self.retry {
                         if retry.should_retry(&err) && attempt < max_attempts {
@@ -469,23 +542,154 @@ impl HttpRequest {
                             continue;
                         }
                     }
-                    return Err(err);
+                    break Err(err);
                 }
             }
+        };
+
+        let mut outcome = outcome?;
+
+        // P1-4: when the policy asks for redirects, walk the chain ourselves so
+        // every hop is validated. Intermediate hops are not retried: a fresh
+        // attempt would re-enter a chain we have already partly walked.
+        if self.redirect_policy.follow_redirects {
+            outcome = self.follow_chain(&pinned, outcome).await?;
+        }
+
+        let (status, headers, body, url) = outcome;
+
+        if status == 429 {
+            return Err(BeanStreamError::RateLimited);
+        }
+        if (500..600).contains(&status) {
+            return Err(BeanStreamError::ServerError(status));
+        }
+
+        let mut response = HttpResponse {
+            status,
+            headers,
+            body,
+            url,
+        };
+
+        // P1-3: never surface secrets to the caller.
+        response.redact();
+
+        if status == 304 {
+            if cacheable {
+                if let Some(cache) = &self.cache {
+                    if let Some(mut hit) = cache.get(self.method.as_str(), &self.url) {
+                        hit.status = 304;
+                        response = hit;
+                    }
+                }
+            }
+        } else if cacheable && response.is_success() {
+            if let Some(cache) = &self.cache {
+                cache.insert(self.method.as_str(), response.clone());
+            }
+        }
+
+        if !crate::progress::report_complete(&self.progress, response.body.len() as u64) {
+            return Err(BeanStreamError::RequestAborted);
+        }
+
+        Ok(response)
+    }
+
+    /// Walk a redirect chain starting from `outcome`, validating every hop.
+    ///
+    /// `outcome` is the result of the first request. Each subsequent hop is
+    /// checked against the redirect policy, re-validated as a fresh URL, and
+    /// re-pinned to its own validated addresses, so a redirect cannot be used to
+    /// reach a private address or a host outside scope (P1-4).
+    async fn follow_chain(
+        &self,
+        pinned: &Option<(String, Vec<SocketAddr>)>,
+        outcome: (u16, Vec<(String, String)>, Vec<u8>, String),
+    ) -> Result<(u16, Vec<(String, String)>, Vec<u8>, String)> {
+        let mut current = outcome;
+        let mut visited: Vec<Url> = vec![Url::parse(&self.url)?];
+
+        let mut method = self.method.clone();
+        let mut headers = self.headers.clone();
+        let mut body = self.body.clone();
+
+        loop {
+            let (status, response_headers, _, url) = &current;
+
+            // 304 is a cache validation response, not a redirect.
+            if !(300..400).contains(status) || *status == 304 {
+                return Ok(current);
+            }
+
+            let location = Self::location_of(response_headers, *status)?;
+            let current_url = Url::parse(url)?;
+
+            let hop = self.plan_hop(
+                &visited,
+                &current_url,
+                *status,
+                location,
+                &method,
+                &headers,
+                &body,
+            )?;
+
+            visited.push(hop.url.clone());
+
+            // Pin this hop's host the same way the original request was pinned.
+            let parsed = validate_url(hop.url.as_str())?;
+            let hop_pinned = if pinned
+                .as_ref()
+                .map(|(host, _)| *host == parsed.host.host)
+                .unwrap_or(false)
+                && parsed.port == self.parsed_url.port
+            {
+                pinned.clone()
+            } else {
+                self.resolve_pin(&parsed.host, parsed.port).await?
+            };
+
+            // The hop's own method/headers/body become the next request's, so a
+            // later hop is rewritten from what was actually sent.
+            method = hop.method.clone();
+            headers = hop.headers.clone();
+            body = hop.body.clone();
+
+            current = self
+                .send_target(
+                    &hop_pinned,
+                    &hop.method,
+                    hop.url.as_str(),
+                    &hop.headers,
+                    hop.body.as_deref(),
+                    None,
+                )
+                .await?;
         }
     }
 
-    async fn send_once(
+    /// Build and send one request against `target`.
+    ///
+    /// `method`, `headers` and `body` are explicit so a redirect hop can change
+    /// them (303 rewrites POST to GET, and credentials are dropped when the hop
+    /// changes origin).
+    async fn send_target(
         &self,
         pinned: &Option<(String, Vec<SocketAddr>)>,
+        method: &Method,
+        target: &str,
+        headers: &[(String, String)],
+        body: Option<&str>,
         if_none_match: Option<&str>,
     ) -> Result<(u16, Vec<(String, String)>, Vec<u8>, String)> {
         // P1-1: the client is pinned to the addresses validated up front, so
         // reqwest does not re-resolve the hostname at connect time.
         let client = self.build_client(pinned.as_ref())?;
 
-        let mut request = client.request(self.method.clone(), &self.url);
-        for (name, value) in &self.headers {
+        let mut request = client.request(method.clone(), target);
+        for (name, value) in headers {
             let name = HeaderName::from_bytes(name.as_bytes())
                 .map_err(|_| BeanStreamError::HeaderError("Invalid header name".to_string()))?;
             let value = HeaderValue::from_str(value)
@@ -495,8 +699,8 @@ impl HttpRequest {
         if let Some(etag) = if_none_match {
             request = request.header("If-None-Match", etag);
         }
-        if let Some(body) = &self.body {
-            request = request.body(body.clone());
+        if let Some(body) = body {
+            request = request.body(body.to_string());
         }
 
         let response = request.send().await.map_err(|e| {
@@ -567,6 +771,99 @@ impl HttpRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Minimal HTTP/1.1 server used by the redirect tests.
+    ///
+    /// `route` maps a request path to a raw response; unrouted paths get a
+    /// plain 200. Every request is recorded verbatim so tests can assert on
+    /// what actually reached the wire.
+    async fn spawn_test_server(
+        route: Vec<(String, &'static str)>,
+    ) -> (
+        String,
+        Arc<tokio::sync::Mutex<Vec<String>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
+
+        let routes = Arc::new(route);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let seen = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+
+        let recorder = seen.clone();
+        let handle = tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = match listener.accept().await {
+                    Ok(pair) => pair,
+                    Err(_) => return,
+                };
+                let recorder = recorder.clone();
+                let routes = routes.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 8192];
+                    let mut raw = Vec::new();
+                    loop {
+                        match socket.try_read(&mut buf) {
+                            Ok(0) => break,
+                            Ok(n) => {
+                                raw.extend_from_slice(&buf[..n]);
+                                if raw.windows(4).any(|w| w == b"\r\n\r\n") {
+                                    break;
+                                }
+                            }
+                            Err(_) => tokio::time::sleep(Duration::from_millis(5)).await,
+                        }
+                        if raw.windows(4).any(|w| w == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+
+                    let text = String::from_utf8_lossy(&raw).to_string();
+                    recorder.lock().await.push(text.clone());
+
+                    let path = text
+                        .lines()
+                        .next()
+                        .and_then(|line| line.split_whitespace().nth(1))
+                        .unwrap_or("/")
+                        .to_string();
+                    let response = routes
+                        .iter()
+                        .find(|(prefix, _)| path == *prefix)
+                        .map(|(_, body)| *body)
+                        .unwrap_or(OK);
+
+                    let _ = socket.write_all(response.as_bytes()).await;
+                    let _ = socket.flush().await;
+                    let _ = socket.shutdown().await;
+                });
+            }
+        });
+
+        (format!("127.0.0.1:{port}"), seen, handle)
+    }
+
+    /// Build a request against the local test server.
+    ///
+    /// Literal private IPs are blocked by `validate_url`, so start from a
+    /// public URL and retarget the parsed parts, which is exactly what the
+    /// pinning and redirect code consumes.
+    fn local_request(method: Method, addr: &str, path: &str) -> HttpRequest {
+        let mut request = HttpRequest::new(method, "https://8.8.8.8/").unwrap();
+        let port: u16 = addr.rsplit(':').next().unwrap().parse().unwrap();
+        request.url = format!("http://{addr}{path}");
+        request.parsed_url.port = port;
+        request.parsed_url.scheme = crate::url_validation::Scheme::Http;
+        request.parsed_url.host = ValidatedHost {
+            host: "127.0.0.1".to_string(),
+            ip_addr: Some("127.0.0.1".parse().unwrap()),
+        };
+        request.scope_validator = ScopeValidator::new(false);
+        request.timeout = Duration::from_secs(5);
+        request
+    }
 
     #[test]
     fn creates_validated_requests() {
@@ -751,6 +1048,353 @@ mod tests {
             .with_cache(cache);
         let res = req.send().await.unwrap();
         assert_eq!(res.body, b"cached-body");
+    }
+
+    // --- P1-4: follow_redirects is honoured at runtime ---
+
+    const OK: &str = "HTTP/1.1 200 OK\r\n\
+                      Content-Type: text/plain\r\n\
+                      Content-Length: 5\r\n\
+                      Connection: close\r\n\r\nhello";
+
+    fn redirect_to(location: &str) -> String {
+        format!(
+            "HTTP/1.1 302 Found\r\n\
+             Location: {location}\r\n\
+             Content-Length: 0\r\n\
+             Connection: close\r\n\r\n"
+        )
+    }
+
+    #[tokio::test]
+    async fn redirects_are_not_followed_by_default() {
+        // /start redirects to /final, which would return 200. With the default
+        // policy the caller must see the 302 itself.
+        let (addr, seen, _server) =
+            spawn_test_server(vec![("/start".to_string(), redirect_to("/final").leak())]).await;
+
+        let request = local_request(Method::GET, &addr, "/start");
+        let response = request.send().await.unwrap();
+
+        assert_eq!(response.status, 302);
+        assert_eq!(
+            seen.lock().await.len(),
+            1,
+            "the chain must not be walked when follow_redirects is off"
+        );
+    }
+
+    #[tokio::test]
+    async fn follow_redirects_is_consulted_by_send() {
+        // Same server and same hop, but with follow_redirects enabled the 302 is
+        // no longer handed straight back: send() walks the chain and puts the
+        // hop through the redirect policy. Before P1-4 the flag was inert and
+        // this returned the same 302 as the test above.
+        let (addr, seen, _server) =
+            spawn_test_server(vec![("/start".to_string(), redirect_to("/final").leak())]).await;
+
+        let request = local_request(Method::GET, &addr, "/start")
+            .redirect_policy(RedirectPolicy::default().follow_redirects(true));
+        let outcome = request.send().await;
+
+        assert!(
+            matches!(
+                &outcome,
+                Err(BeanStreamError::HostNotAllowed(host)) if host == "127.0.0.1"
+            ),
+            "the follow_redirects hop must be policy-checked, got {outcome:?}"
+        );
+        assert_eq!(
+            seen.lock().await.len(),
+            1,
+            "the refused hop must not have been connected to"
+        );
+    }
+
+    #[tokio::test]
+    async fn redirect_without_location_is_refused() {
+        let no_location = "HTTP/1.1 302 Found\r\n\
+                           Content-Length: 0\r\n\
+                           Connection: close\r\n\r\n";
+        let (addr, _seen, _server) =
+            spawn_test_server(vec![("/start".to_string(), no_location)]).await;
+
+        let request = local_request(Method::GET, &addr, "/start")
+            .redirect_policy(RedirectPolicy::default().follow_redirects(true));
+        let outcome = request.send().await;
+
+        assert!(
+            matches!(
+                &outcome,
+                Err(BeanStreamError::RedirectBlocked(message))
+                    if message.contains("no Location header")
+            ),
+            "expected a missing-Location rejection, got {outcome:?}"
+        );
+    }
+
+    // --- hop planning rules, tested directly (no server needed) ---
+    //
+    // A localhost redirect chain can never be walked end to end: hop
+    // validation re-runs `validate_url`, and the local test server is by
+    // definition a private address. That is the protection working, so the
+    // per-hop rules are exercised through `plan_hop` instead.
+
+    /// A GET to a public host with redirects enabled.
+    fn hop_request() -> HttpRequest {
+        let mut request = HttpRequest::get("https://example.com/start").unwrap();
+        request.redirect_policy = RedirectPolicy::default().follow_redirects(true);
+        request.redirect_policy.allow_host("example.com");
+        request
+    }
+
+    fn plan(
+        request: &HttpRequest,
+        visited: &[&str],
+        from: &str,
+        status: u16,
+        location: &str,
+        method: Method,
+    ) -> Result<RedirectHop> {
+        let visited = visited
+            .iter()
+            .map(|url| Url::parse(url).unwrap())
+            .collect::<Vec<_>>();
+        request.plan_hop(
+            &visited,
+            &Url::parse(from).unwrap(),
+            status,
+            location,
+            &method,
+            &request.headers,
+            &request.body,
+        )
+    }
+
+    #[test]
+    fn hop_resolves_a_relative_location_against_the_current_url() {
+        let request = hop_request();
+        let hop = plan(
+            &request,
+            &["https://example.com/start"],
+            "https://example.com/start",
+            302,
+            "/final",
+            Method::GET,
+        )
+        .unwrap();
+
+        assert_eq!(hop.url.as_str(), "https://example.com/final");
+        assert_eq!(hop.method, Method::GET);
+    }
+
+    #[test]
+    fn hop_to_a_private_address_is_refused() {
+        // Even a policy that permits any host cannot redirect into the private
+        // network: every hop is re-validated as a fresh URL (P1-4).
+        let mut request = hop_request();
+        request.redirect_policy = RedirectPolicy::relaxed(10);
+
+        let outcome = plan(
+            &request,
+            &["https://example.com/start"],
+            "https://example.com/start",
+            302,
+            "https://127.0.0.1/admin",
+            Method::GET,
+        );
+
+        assert!(
+            matches!(&outcome, Err(BeanStreamError::PrivateNetworkAccess(_))),
+            "expected the private hop to be refused, got {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn hop_to_a_host_outside_the_policy_is_refused() {
+        let request = hop_request();
+        let outcome = plan(
+            &request,
+            &["https://example.com/start"],
+            "https://example.com/start",
+            302,
+            "https://evil.com/steal",
+            Method::GET,
+        );
+
+        assert!(
+            matches!(&outcome, Err(BeanStreamError::HostNotAllowed(_))),
+            "expected a host outside the allow list to be refused, got {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn hop_to_a_non_http_scheme_is_refused() {
+        let request = hop_request();
+        let outcome = plan(
+            &request,
+            &["https://example.com/start"],
+            "https://example.com/start",
+            302,
+            "file:///etc/passwd",
+            Method::GET,
+        );
+
+        assert!(
+            matches!(&outcome, Err(BeanStreamError::RedirectBlocked(_))),
+            "expected a non-http target to be refused, got {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn hop_loop_is_detected() {
+        let request = hop_request();
+        let outcome = plan(
+            &request,
+            &["https://example.com/a", "https://example.com/b"],
+            "https://example.com/b",
+            302,
+            "/a",
+            Method::GET,
+        );
+
+        assert!(
+            matches!(
+                &outcome,
+                Err(BeanStreamError::RedirectBlocked(message))
+                    if message.contains("loop")
+            ),
+            "expected loop detection, got {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn hop_limit_is_enforced() {
+        let mut request = hop_request();
+        request.redirect_policy.max_redirects = 1;
+
+        let outcome = plan(
+            &request,
+            &["https://example.com/a"],
+            "https://example.com/a",
+            302,
+            "/b",
+            Method::GET,
+        );
+
+        assert!(
+            matches!(&outcome, Err(BeanStreamError::TooManyRedirects(1))),
+            "expected the redirect budget to stop the chain, got {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn three_oh_two_on_a_post_becomes_get_without_a_body() {
+        let mut request = hop_request();
+        request.body = Some("secret=payload".to_string());
+
+        let hop = plan(
+            &request,
+            &["https://example.com/start"],
+            "https://example.com/start",
+            302,
+            "/final",
+            Method::POST,
+        )
+        .unwrap();
+
+        assert_eq!(hop.method, Method::GET);
+        assert_eq!(hop.body, None, "the body must not be replayed on a GET");
+    }
+
+    #[test]
+    fn three_oh_three_always_becomes_get() {
+        let mut request = hop_request();
+        request.body = Some("secret=payload".to_string());
+
+        let hop = plan(
+            &request,
+            &["https://example.com/start"],
+            "https://example.com/start",
+            303,
+            "/final",
+            Method::PUT,
+        )
+        .unwrap();
+
+        assert_eq!(hop.method, Method::GET);
+        assert_eq!(hop.body, None);
+    }
+
+    #[test]
+    fn a_redirect_that_is_not_rewritten_keeps_its_method() {
+        // Rewriting applies only to 303 and to 301/302 on POST, so a 307 keeps
+        // the caller's method -- and its body.
+        let mut request = hop_request();
+        request.body = Some("payload".to_string());
+
+        let hop = plan(
+            &request,
+            &["https://example.com/start"],
+            "https://example.com/start",
+            307,
+            "/final",
+            Method::PUT,
+        )
+        .unwrap();
+
+        assert_eq!(hop.method, Method::PUT);
+        assert_eq!(hop.body.as_deref(), Some("payload"));
+    }
+
+    #[test]
+    fn credentials_are_dropped_when_a_hop_changes_origin() {
+        let mut request = hop_request();
+        request.redirect_policy.allow_host("other.com");
+        request.scope_validator = ScopeValidator::new(false);
+        request.headers = vec![
+            ("authorization".to_string(), "Bearer hunter2".to_string()),
+            ("x-trace".to_string(), "keep-me".to_string()),
+        ];
+
+        let hop = plan(
+            &request,
+            &["https://example.com/start"],
+            "https://example.com/start",
+            302,
+            "https://other.com/final",
+            Method::GET,
+        )
+        .unwrap();
+
+        assert_eq!(hop.url.host_str(), Some("other.com"));
+        assert_eq!(
+            hop.headers,
+            vec![("x-trace".to_string(), "keep-me".to_string())],
+            "credentials must not follow a cross-origin hop"
+        );
+        assert_eq!(hop.body, None);
+    }
+
+    #[test]
+    fn headers_survive_a_same_origin_hop() {
+        let mut request = hop_request();
+        request.headers = vec![
+            ("authorization".to_string(), "Bearer hunter2".to_string()),
+            ("x-trace".to_string(), "keep-me".to_string()),
+        ];
+
+        let hop = plan(
+            &request,
+            &["https://example.com/start"],
+            "https://example.com/start",
+            302,
+            "/final",
+            Method::GET,
+        )
+        .unwrap();
+
+        assert_eq!(hop.headers.len(), 2, "same-origin hops keep their headers");
     }
 
     #[tokio::test]
