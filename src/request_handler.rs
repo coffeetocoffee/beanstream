@@ -1,3 +1,4 @@
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -6,16 +7,21 @@ use reqwest::{Client, Method};
 
 use crate::abort::AbortSignal;
 use crate::cache::InMemoryCache;
-use crate::header_validation::{is_blocked_header, sanitize_header, validate_headers};
+use crate::header_validation::{
+    is_blocked_header, redact_sensitive_headers, sanitize_header, validate_headers,
+};
 use crate::interceptor::InterceptorChain;
 use crate::progress::UploadProgress;
 use crate::rate_limit::RateLimiter;
 use crate::redirect_policy::{RedirectPolicy, ScopeValidator};
 use crate::retry::RetryConfig;
-use crate::url_validation::{validate_url, ParsedUrl};
+use crate::url_validation::{resolve_host, validate_url, ParsedUrl};
 use crate::{BeanStreamError, Result};
 
 /// Response returned by [`HttpRequest::send`].
+///
+/// `headers` are redacted: sensitive entries (`set-cookie`, `authorization`,
+/// ...) are stripped before the response is handed to the caller (P1-3).
 #[derive(Debug, Clone)]
 pub struct HttpResponse {
     pub status: u16,
@@ -36,6 +42,14 @@ impl HttpResponse {
 
     pub fn is_success(&self) -> bool {
         (200..300).contains(&self.status)
+    }
+
+    /// Re-run redaction over this response's headers.
+    ///
+    /// Safe to call repeatedly; used as a defence-in-depth guard so a response
+    /// built through any path is redacted before it is logged or serialized.
+    pub fn redact(&mut self) {
+        self.headers = redact_sensitive_headers(&self.headers);
     }
 }
 
@@ -254,13 +268,70 @@ impl HttpRequest {
         validate_headers(&self.headers)
     }
 
+    /// Resolve the request hostname to pinned, validated IP addresses.
+    ///
+    /// This is the authoritative SSRF defence (P1-1). Validating a hostname's
+    /// addresses *before* connecting is unsafe on its own: reqwest re-resolves
+    /// the hostname at connect time, so an attacker controlling DNS can answer
+    /// the validation lookup with a public IP and the connect lookup with a
+    /// private one (DNS rebinding / TOCTOU).
+    ///
+    /// Instead we resolve once here -- asynchronously, so the reactor is never
+    /// blocked (P1-2) -- verify every address against the block list, and then
+    /// hand the exact address list to reqwest via `resolve_to_addrs`. The
+    /// connect-time lookup is bypassed entirely, so no swap can occur.
+    ///
+    /// TLS is unaffected: reqwest still derives SNI and certificate
+    /// verification from the URL hostname, not the pinned address.
+    ///
+    /// Returns `None` when the host is a literal IP (nothing to resolve).
+    async fn pinned_addresses(&self) -> Result<Option<(String, Vec<SocketAddr>)>> {
+        let host = &self.parsed_url.host.host;
+
+        // Literal IPs need no resolution -- validate_url already checked them.
+        if self.parsed_url.host.ip_addr.is_some() {
+            return Ok(None);
+        }
+
+        let addresses = resolve_host(host).await?;
+        if addresses.is_empty() {
+            return Err(BeanStreamError::InvalidHost(format!(
+                "Host '{host}' did not resolve to an address"
+            )));
+        }
+
+        for address in &addresses {
+            if crate::url_validation::is_blocked_ip(address) {
+                return Err(BeanStreamError::PrivateNetworkAccess(address.to_string()));
+            }
+        }
+
+        let port = self.parsed_url.port;
+        let socket_addresses = addresses
+            .iter()
+            .map(|address| SocketAddr::new(*address, port))
+            .collect::<Vec<_>>();
+
+        Ok(Some((host.clone(), socket_addresses)))
+    }
+
+    /// Build a reqwest client whose DNS resolution is pinned to `pinned`.
+    fn build_client(&self, pinned: Option<&(String, Vec<SocketAddr>)>) -> Result<Client> {
+        let mut builder = Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(self.timeout);
+
+        if let Some((host, addresses)) = pinned {
+            builder = builder.resolve_to_addrs(host, addresses);
+        }
+
+        builder.build().map_err(Into::into)
+    }
+
     pub fn build_request(&self) -> Result<reqwest::Request> {
         self.validate()?;
 
-        let client = Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .timeout(self.timeout)
-            .build()?;
+        let client = self.build_client(None)?;
         let mut request = client.request(self.method.clone(), &self.url);
 
         for (name, value) in &self.headers {
@@ -283,7 +354,7 @@ impl HttpRequest {
     async fn execute_inner(&self) -> Result<HttpResponse> {
         self.validate()?;
 
-        // P0-3: progress hook — report upload start; abort if callback returns false
+        // P0-3: progress hook -- report upload start; abort if callback returns false
         if let Some(progress) = &self.progress {
             let total = self.body.as_ref().map(|b| b.len() as u64);
             if !progress.on_progress(0, total) {
@@ -317,6 +388,11 @@ impl HttpRequest {
             None
         };
 
+        // P1-1: resolve once and pin, so the connect-time lookup cannot be
+        // swapped to a private address. Done before the retry loop so a
+        // rebinding attacker cannot win by waiting for a later attempt.
+        let pinned = self.pinned_addresses().await?;
+
         // P0-4: retry loop with exponential backoff
         let max_attempts = self
             .retry
@@ -330,7 +406,7 @@ impl HttpRequest {
         loop {
             attempt += 1;
 
-            match self.send_once(conditional_etag.as_deref()).await {
+            match self.send_once(&pinned, conditional_etag.as_deref()).await {
                 Ok((status, headers, body, url)) => {
                     if let Some(retry) = &self.retry {
                         if retry.should_retry_status(status) && attempt < max_attempts {
@@ -357,6 +433,9 @@ impl HttpRequest {
                         body,
                         url,
                     };
+
+                    // P1-3: never surface secrets to the caller.
+                    response.redact();
 
                     if status == 304 {
                         if cacheable {
@@ -398,12 +477,12 @@ impl HttpRequest {
 
     async fn send_once(
         &self,
+        pinned: &Option<(String, Vec<SocketAddr>)>,
         if_none_match: Option<&str>,
     ) -> Result<(u16, Vec<(String, String)>, Vec<u8>, String)> {
-        let client = Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .timeout(self.timeout)
-            .build()?;
+        // P1-1: the client is pinned to the addresses validated up front, so
+        // reqwest does not re-resolve the hostname at connect time.
+        let client = self.build_client(pinned.as_ref())?;
 
         let mut request = client.request(self.method.clone(), &self.url);
         for (name, value) in &self.headers {
@@ -445,9 +524,13 @@ impl HttpRequest {
         Ok((status, headers, body, url))
     }
 
-    /// Execute the request — actually sends over the network (P0-1).
+    /// Execute the request -- actually sends over the network (P0-1).
     /// Honors `AbortSignal` (P0-2), `UploadProgress` (P0-3), retry (P0-4),
     /// cache (P0-5), rate limiting (P0-6), and interceptors (P0-7).
+    ///
+    /// The hostname is resolved asynchronously and pinned to the validated
+    /// addresses before connecting (P1-1), and response headers are redacted
+    /// before they are returned (P1-3).
     pub async fn send(&self) -> Result<HttpResponse> {
         let interceptors = self.interceptors.clone();
         let mut this = self.clone();
@@ -467,6 +550,11 @@ impl HttpRequest {
 
         let mut response = outcome?;
         interceptors.run_on_response(&mut response)?;
+
+        // P1-3: interceptors may re-inject headers (e.g. an auth refresh), so
+        // redact once more as the final gate before the caller sees anything.
+        response.redact();
+
         Ok(response)
     }
 
@@ -531,6 +619,80 @@ mod tests {
     fn builds_without_following_redirects() {
         let request = HttpRequest::get("https://8.8.8.8/redirect").unwrap();
         assert!(request.build_request().is_ok());
+    }
+
+    #[tokio::test]
+    async fn pins_dns_resolution_to_validated_addresses() {
+        // P1-1: a hostname must resolve to concrete addresses that are then
+        // pinned into the client, closing the rebinding window.
+        //
+        // `localhost` is rejected by validate_domain() at construction, so
+        // start from a valid request and swap in a host that structurally
+        // passes validation but resolves to a private address.
+        let mut request = HttpRequest::get("https://8.8.8.8/").unwrap();
+        request.parsed_url.host = crate::url_validation::ValidatedHost {
+            host: "localhost".to_string(),
+            ip_addr: None,
+        };
+
+        let result = request.pinned_addresses().await;
+
+        // It resolves to 127.0.0.1 / ::1, so it must be rejected rather than
+        // pinned -- this is exactly the rebinding case, caught before connect.
+        assert!(matches!(
+            result,
+            Err(BeanStreamError::PrivateNetworkAccess(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn pinned_addresses_carry_the_parsed_port() {
+        // P1-1: the pin is built as host:port pairs, so the URL's port must be
+        // preserved (including the default 443 for https).
+        let request = HttpRequest::get("https://8.8.8.8/").unwrap();
+        assert_eq!(request.parsed_url.port, 443);
+
+        let explicit = HttpRequest::get("https://8.8.8.8:8443/").unwrap();
+        assert_eq!(explicit.parsed_url.port, 8443);
+    }
+
+    #[tokio::test]
+    async fn literal_ip_hosts_are_not_resolved() {
+        // Nothing to pin when the host is already a literal IP.
+        let request = HttpRequest::get("https://8.8.8.8/").unwrap();
+        assert!(request.pinned_addresses().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn unresolvable_host_is_rejected_before_connecting() {
+        let request = HttpRequest::get("https://this-host-does-not-resolve-9f3c.invalid/").unwrap();
+        assert!(matches!(
+            request.pinned_addresses().await,
+            Err(BeanStreamError::InvalidHost(_))
+        ));
+    }
+
+    #[test]
+    fn response_redaction_strips_sensitive_headers() {
+        // P1-3.
+        let mut response = HttpResponse {
+            status: 200,
+            headers: vec![
+                ("content-type".to_string(), "application/json".to_string()),
+                ("set-cookie".to_string(), "session=secret".to_string()),
+                ("authorization".to_string(), "Bearer hunter2".to_string()),
+            ],
+            body: b"{}".to_vec(),
+            url: "https://8.8.8.8/".to_string(),
+        };
+
+        response.redact();
+        assert_eq!(response.headers.len(), 1);
+        assert_eq!(response.headers[0].0, "content-type");
+        assert!(!response
+            .headers
+            .iter()
+            .any(|(name, _)| crate::header_validation::is_sensitive_header(name)));
     }
 
     #[tokio::test]

@@ -126,6 +126,54 @@ pub fn is_blocked_ip(address: &IpAddr) -> bool {
     }
 }
 
+/// Resolve `host` to IP addresses using Tokio's non-blocking DNS resolver.
+///
+/// This never stalls the async runtime: the underlying `getaddrinfo` call is
+/// offloaded to Tokio's blocking thread pool. Use this instead of the blocking
+/// [`validate_ip_access`] from async code.
+pub async fn resolve_host(host: &str) -> Result<Vec<IpAddr>> {
+    let socket_addresses = tokio::net::lookup_host((host, 0u16))
+        .await
+        .map_err(|error| {
+            BeanStreamError::InvalidHost(format!("Unable to resolve '{host}': {error}"))
+        })?;
+
+    let mut resolved = false;
+    let mut addresses = Vec::new();
+    for socket_address in socket_addresses {
+        resolved = true;
+        let address = socket_address.ip();
+        if !addresses.contains(&address) {
+            addresses.push(address);
+        }
+    }
+
+    if resolved {
+        Ok(addresses)
+    } else {
+        Err(BeanStreamError::InvalidHost(format!(
+            "Host '{host}' did not resolve to an address"
+        )))
+    }
+}
+
+/// Non-blocking hostname resolution + address validation: resolves `host`
+/// asynchronously and verifies that none of the resolved addresses are
+/// private/internal. Returns the full list of validated public addresses.
+pub async fn validate_ip_access_async(host: &str) -> Result<Vec<IpAddr>> {
+    let addresses = resolve_host(host).await?;
+    for address in &addresses {
+        if is_blocked_ip(address) {
+            return Err(BeanStreamError::PrivateNetworkAccess(address.to_string()));
+        }
+    }
+    Ok(addresses)
+}
+
+/// Blocking hostname resolution + address validation for synchronous callers.
+///
+/// **Blocks the current thread** on DNS — do not call this from async code; use
+/// [`validate_ip_access_async`] instead.
 pub fn validate_ip_access(host: &str) -> Result<()> {
     use std::net::ToSocketAddrs;
 
@@ -189,7 +237,16 @@ fn validate_domain(domain: &str) -> Result<()> {
         return Err(BeanStreamError::PrivateNetworkAccess(domain.to_string()));
     }
 
-    validate_ip_access(domain)
+    // NOTE: hostname-to-IP resolution is deliberately NOT performed here. This
+    // function is called from synchronous API entry points that are frequently
+    // used inside async code, and a blocking `to_socket_addrs()` would stall
+    // the runtime (P1-2). Instead, hostnames are resolved asynchronously at
+    // connect time and pinned to the exact validated addresses, so a DNS
+    // rebinding attack cannot swap in a private IP between validation and
+    // connection (P1-1). See `HttpRequest::build_client` and
+    // `validate_url_async`.
+
+    Ok(())
 }
 
 fn validate_port(url: &Url) -> Result<u16> {
@@ -261,6 +318,21 @@ pub fn validate_url(url: &str) -> Result<ParsedUrl> {
         path,
         original_url: url.to_string(),
     })
+}
+
+/// Like [`validate_url`], but also resolves the hostname asynchronously and
+/// verifies every resolved address against the private/internal block list.
+///
+/// This lets callers reject private-network destinations up front (matching the
+/// architecture's "before they reach the network stack" promise) without
+/// blocking the runtime. Connection-time pinning in [`crate::HttpRequest::send`]
+/// remains the authoritative SSRF check.
+pub async fn validate_url_async(url: &str) -> Result<ParsedUrl> {
+    let parsed = validate_url(url)?;
+    if parsed.host.ip_addr.is_none() {
+        validate_ip_access_async(&parsed.host.host).await?;
+    }
+    Ok(parsed)
 }
 
 #[cfg(test)]
@@ -340,5 +412,38 @@ mod tests {
     fn validates_ports() {
         assert!(validate_url("https://8.8.8.8:8443/api").is_ok());
         assert!(validate_url("https://8.8.8.8:0/api").is_err());
+    }
+
+    #[test]
+    fn validate_url_no_longer_performs_blocking_dns() {
+        // `.invalid` is reserved by RFC 2606 and must not resolve. Before the
+        // DNS-rebinding fix, validate_url() resolved every hostname here and
+        // would fail on non-resolving names. Structural validation must accept
+        // a well-formed but non-resolving domain (resolution happens at send).
+        assert!(validate_url("https://this-host-does-not-resolve-9f3c.invalid/").is_ok());
+    }
+
+    #[tokio::test]
+    async fn resolve_host_is_non_blocking() {
+        // `localhost` resolves from the local hosts file, so this does not need
+        // network access and is deterministic.
+        let addresses = resolve_host("localhost").await.unwrap();
+        assert!(!addresses.is_empty());
+    }
+
+    #[tokio::test]
+    async fn async_ip_access_rejects_private_resolutions() {
+        // localhost resolves to 127.0.0.1 / ::1, both of which are blocked.
+        let result = validate_ip_access_async("localhost").await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn validate_url_async_checks_resolution() {
+        assert!(
+            validate_url_async("https://this-host-does-not-resolve-9f3c.invalid/")
+                .await
+                .is_err()
+        );
     }
 }

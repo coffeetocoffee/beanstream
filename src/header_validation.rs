@@ -75,6 +75,21 @@ pub fn is_sensitive_header(name: &str) -> bool {
     .any(|sensitive| name.eq_ignore_ascii_case(sensitive))
 }
 
+/// Drop sensitive headers (e.g. `set-cookie`, `authorization`) from a header
+/// list, returning only the safe-to-expose pairs.
+///
+/// This implements the architecture's "Layer 3: Sensitive Data Protection":
+/// responses never surface secrets unless the application explicitly opts in
+/// (P1-3). It is applied to every network response in
+/// [`crate::HttpRequest::send`] and again when a response is serialized.
+pub fn redact_sensitive_headers(headers: &[(String, String)]) -> Vec<(String, String)> {
+    headers
+        .iter()
+        .filter(|(name, _)| !is_sensitive_header(name))
+        .cloned()
+        .collect()
+}
+
 pub fn is_blocked_header(name: &str) -> bool {
     [
         "host",
@@ -135,5 +150,27 @@ mod tests {
         assert!(is_blocked_header("Host"));
         assert!(is_blocked_header("transfer-encoding"));
         assert!(!is_blocked_header("x-test"));
+    }
+
+    #[test]
+    fn redacts_sensitive_headers_but_keeps_the_rest() {
+        let headers = vec![
+            ("content-type".to_string(), "application/json".to_string()),
+            (
+                "set-cookie".to_string(),
+                "session=abc; HttpOnly".to_string(),
+            ),
+            ("authorization".to_string(), "Bearer [REDACTED]".to_string()),
+            ("x-trace-id".to_string(), "123".to_string()),
+        ];
+
+        let redacted = redact_sensitive_headers(&headers);
+        assert_eq!(
+            redacted,
+            vec![
+                ("content-type".to_string(), "application/json".to_string()),
+                ("x-trace-id".to_string(), "123".to_string()),
+            ]
+        );
     }
 }
