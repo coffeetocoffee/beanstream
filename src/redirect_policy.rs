@@ -50,6 +50,17 @@ pub struct RedirectPolicy {
     pub allowed_hosts: HashSet<String>,
     pub denied_hosts: HashSet<String>,
     pub allow_any_redirect: bool,
+    /// Whether `HttpRequest::send` should follow 3xx responses (P1-4).
+    ///
+    /// Defaults to `false`, so redirects are returned to the caller unless this
+    /// is enabled — matching the previous behaviour. When enabled, every hop is
+    /// checked with [`RedirectPolicy::check_redirect`].
+    pub follow_redirects: bool,
+    /// Permit a redirect from `https` to plaintext `http` (P1-5).
+    ///
+    /// Defaults to `false`: once any hop in a chain has used TLS, a later hop
+    /// may not drop back to plaintext.
+    pub allow_scheme_downgrade: bool,
 }
 
 impl Default for RedirectPolicy {
@@ -60,6 +71,8 @@ impl Default for RedirectPolicy {
             allowed_hosts: HashSet::new(),
             denied_hosts: HashSet::new(),
             allow_any_redirect: false,
+            follow_redirects: false,
+            allow_scheme_downgrade: false,
         }
     }
 }
@@ -82,8 +95,24 @@ impl RedirectPolicy {
             max_redirects,
             track_all_redirects: false,
             allow_any_redirect: true,
+            follow_redirects: true,
             ..Self::default()
         }
+    }
+
+    /// Opt in to letting a redirect move from `https` to plaintext `http`.
+    ///
+    /// Off by default (P1-5). Enabling this weakens transport security and
+    /// should only be used when the destination genuinely cannot serve TLS.
+    pub fn allow_scheme_downgrade(mut self, allow: bool) -> Self {
+        self.allow_scheme_downgrade = allow;
+        self
+    }
+
+    /// Whether the redirect chain should be followed by `HttpRequest::send`.
+    pub fn follow_redirects(mut self, follow: bool) -> Self {
+        self.follow_redirects = follow;
+        self
     }
 
     pub fn allow_host(&mut self, host: &str) {
@@ -104,6 +133,25 @@ impl RedirectPolicy {
                 "Redirect scheme '{}' is not allowed",
                 next_url.scheme()
             )));
+        }
+
+        // P1-5: refuse to move from TLS to plaintext. If any hop so far was
+        // https, a later hop must not drop to http. This is checked against the
+        // whole chain, not just the immediately preceding URL, so a
+        // https -> http -> https dance cannot launder the downgrade.
+        if !self.allow_scheme_downgrade {
+            let chain_used_tls = previous_urls
+                .iter()
+                .chain(std::iter::once(next_url))
+                .any(|url| url.scheme() == "https");
+
+            if chain_used_tls && next_url.scheme() == "http" {
+                return Err(BeanStreamError::RedirectBlocked(
+                    "Refusing https -> http downgrade: redirect would move an \
+                     encrypted connection to plaintext"
+                        .to_string(),
+                ));
+            }
         }
 
         let next_host = next_url.host_str().ok_or(BeanStreamError::NoHost)?;
@@ -147,16 +195,16 @@ impl RedirectPolicy {
 
 #[derive(Debug, Clone)]
 pub struct ScopeValidator {
-    allow_list: Vec<String>,
-    deny_list: Vec<String>,
+    allow_list: HashSet<String>,
+    deny_list: HashSet<String>,
     default_deny: bool,
 }
 
 impl ScopeValidator {
     pub fn new(default_deny: bool) -> Self {
         Self {
-            allow_list: Vec::new(),
-            deny_list: Vec::new(),
+            allow_list: HashSet::new(),
+            deny_list: HashSet::new(),
             default_deny,
         }
     }
@@ -181,12 +229,27 @@ impl ScopeValidator {
         self
     }
 
+    /// Add a host to the allow list.
+    ///
+    /// The list is a set, so adding the same host twice is a no-op (P3-1) —
+    /// previously duplicates accumulated and made matching O(n) for no benefit.
     pub fn allow_host(&mut self, host: &str) {
-        self.allow_list.push(normalize_host(host));
+        self.allow_list.insert(normalize_host(host));
     }
 
+    /// Add a host to the deny list, ignoring duplicates (P3-1).
     pub fn deny_host(&mut self, host: &str) {
-        self.deny_list.push(normalize_host(host));
+        self.deny_list.insert(normalize_host(host));
+    }
+
+    /// Number of distinct allowed hosts. Exposed for tests and diagnostics.
+    pub fn allow_list_len(&self) -> usize {
+        self.allow_list.len()
+    }
+
+    /// Number of distinct denied hosts. Exposed for tests and diagnostics.
+    pub fn deny_list_len(&self) -> usize {
+        self.deny_list.len()
     }
 
     pub fn check_url(&self, url: &str) -> Result<()> {
@@ -311,5 +374,74 @@ mod tests {
             .is_err());
         assert!(validator.check_url("https://notfacebook.com/login").is_ok());
         assert!(validator.check_url("https://other-site.com/page").is_ok());
+    }
+
+    #[test]
+    fn downgrade_from_https_to_http_is_refused() {
+        // P1-5. `strict` seeds the allow list so we are testing the downgrade
+        // rule specifically, not an unrelated HostNotAllowed rejection.
+        let policy = RedirectPolicy::strict(["example.com"]);
+        let previous = vec![Url::parse("https://example.com/secure").unwrap()];
+
+        let result =
+            policy.check_redirect(&previous, &Url::parse("http://example.com/plain").unwrap());
+        assert!(
+            matches!(&result, Err(BeanStreamError::RedirectBlocked(message))
+                if message.contains("downgrade")),
+            "expected a downgrade rejection, got {result:?}"
+        );
+
+        // Staying on https is fine, and http -> http is unaffected.
+        assert!(policy
+            .check_redirect(&previous, &Url::parse("https://example.com/also").unwrap())
+            .is_ok());
+        let http_chain = vec![Url::parse("http://example.com/a").unwrap()];
+        assert!(policy
+            .check_redirect(&http_chain, &Url::parse("http://example.com/b").unwrap())
+            .is_ok());
+    }
+
+    #[test]
+    fn downgrade_is_caught_even_after_an_intermediate_https_hop() {
+        // P1-5: an https -> ... -> http chain must not launder the downgrade;
+        // the check looks at the whole chain, not just the previous hop.
+        let policy = RedirectPolicy::strict(["example.com"]);
+        let chain = vec![
+            Url::parse("https://example.com/start").unwrap(),
+            Url::parse("https://example.com/mid").unwrap(),
+        ];
+        let result =
+            policy.check_redirect(&chain, &Url::parse("http://example.com/plain").unwrap());
+        assert!(
+            matches!(&result, Err(BeanStreamError::RedirectBlocked(message))
+                if message.contains("downgrade")),
+            "expected a downgrade rejection, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn downgrade_can_be_opted_into() {
+        let policy = RedirectPolicy::strict(["example.com"]).allow_scheme_downgrade(true);
+        let previous = vec![Url::parse("https://example.com/secure").unwrap()];
+        assert!(policy
+            .check_redirect(&previous, &Url::parse("http://example.com/plain").unwrap())
+            .is_ok());
+    }
+
+    #[test]
+    fn scope_host_lists_do_not_accumulate_duplicates() {
+        // P3-1: allow_host/deny_host used Vec::push, so repeated hosts piled up.
+        let mut validator = ScopeValidator::new(true);
+        validator.allow_host("Example.com");
+        validator.allow_host("example.com");
+        validator.allow_host("example.com.");
+        validator.deny_host("evil.com");
+        validator.deny_host("evil.com");
+
+        // All three spellings normalize to the same host, so one entry remains.
+        assert_eq!(validator.allow_list_len(), 1);
+        assert_eq!(validator.deny_list_len(), 1);
+        assert!(validator.check_url("https://example.com/api").is_ok());
+        assert!(validator.check_url("https://evil.com/api").is_err());
     }
 }

@@ -8,7 +8,7 @@ use crate::cert_pinning::CertPinConfig;
 use crate::header_validation::{is_blocked_header, sanitize_header};
 use crate::interceptor::InterceptorChain;
 use crate::redirect_policy::{RedirectPolicy, ScopeValidator};
-use crate::request_handler::HttpRequest;
+use crate::request_handler::{HttpRequest, HttpResponse};
 use crate::{BeanStreamError, Result};
 
 #[derive(Debug, Clone)]
@@ -88,6 +88,12 @@ impl HttpClientBuilder {
         Ok(self)
     }
 
+    /// Opt out of private-network blocking for this client.
+    ///
+    /// This **weakens SSRF protection** and exists for clients that legitimately
+    /// target internal hosts. It is applied to requests created by
+    /// [`HttpClientBuilder::create_request`]; previously the flag was stored but
+    /// never read, so it silently did nothing.
     pub fn allow_private_networks(mut self) -> Self {
         self.check_private_ips = false;
         self
@@ -110,7 +116,15 @@ impl HttpClientBuilder {
         self
     }
 
-    pub fn build(self) -> Result<reqwest::Client> {
+    /// Build a plain `reqwest::Client` carrying this builder's transport
+    /// settings (timeouts, user agent, default headers, cert pinning).
+    ///
+    /// This client performs **normal DNS resolution**, so using it to send a
+    /// request bypasses BeanStream's SSRF pinning (P1-1). Prefer
+    /// [`HttpClientBuilder::create_request`], which returns an `HttpRequest`
+    /// that pins the validated addresses before connecting. Use this escape
+    /// hatch only for destinations you already trust.
+    pub fn build(&self) -> Result<reqwest::Client> {
         let user_agent = HeaderValue::from_str(&self.user_agent)
             .map_err(|_| BeanStreamError::InvalidConfiguration("Invalid user agent".to_string()))?;
         let mut client = reqwest::Client::builder()
@@ -144,20 +158,50 @@ impl HttpClientBuilder {
         client.build().map_err(Into::into)
     }
 
+    /// Build the [`RedirectPolicy`] implied by this builder's settings (P1-4).
+    ///
+    /// Host validation used to be gated on `follow_redirects`, which defaults to
+    /// `false` — so the policy silently validated nothing. The two concerns are
+    /// now separate: `max_redirects`/scheme rules always apply, and
+    /// `follow_redirects` controls only whether `HttpRequest::send` walks the
+    /// chain.
     pub fn get_redirect_policy(&self) -> RedirectPolicy {
-        RedirectPolicy {
+        let mut policy = RedirectPolicy {
             max_redirects: self.max_redirects,
-            track_all_redirects: self.follow_redirects,
+            track_all_redirects: true,
             allow_any_redirect: false,
+            follow_redirects: self.follow_redirects,
             ..RedirectPolicy::default()
+        };
+
+        // A base URL is an explicit statement of where this client may talk to,
+        // so seed the allow list from it instead of leaving it empty.
+        if let Some(base_url) = &self.base_url {
+            if let Ok(parsed) = Url::parse(base_url) {
+                if let Some(host) = parsed.host_str() {
+                    policy.allow_host(host);
+                }
+            }
         }
+
+        policy
     }
 
+    /// Send a request created from this builder, going through the pinned send
+    /// path so SSRF validation actually applies (P1-1).
+    pub async fn send(&self, method: Method, target: &str) -> Result<HttpResponse> {
+        self.create_request(method, target)?.send().await
+    }
+
+    /// Build the [`ScopeValidator`] implied by this builder's settings.
+    ///
+    /// When private-network checking is on (the default), known internal ranges
+    /// and reserved names are denied. Callers wanting a host-scoped client can
+    /// pass the result to [`crate::HttpRequest::scope_validator`].
     pub fn create_scope_validator(&self) -> ScopeValidator {
         let validator = ScopeValidator::new(false);
         if self.check_private_ips {
             validator.with_deny_list([
-                "0.0.0.0",
                 "10.*",
                 "100.64.*",
                 "127.0.0.1",
@@ -177,6 +221,13 @@ impl HttpClientBuilder {
         }
     }
 
+    /// Create a validated request that goes through BeanStream's pinned send
+    /// path (P1-1).
+    ///
+    /// Unlike [`HttpClientBuilder::build`], the returned `HttpRequest` resolves
+    /// the host, validates every address, and pins it for the connection. It
+    /// inherits this builder's timeout, redirect policy (P1-4) and default
+    /// headers, all of which used to be silently dropped here.
     pub fn create_request(&self, method: Method, target: &str) -> Result<HttpRequest> {
         let absolute = Url::parse(target).is_ok();
         let url = if absolute {
@@ -193,9 +244,40 @@ impl HttpClientBuilder {
         };
 
         HttpRequest::new(method, &url).map(|mut request| {
+            request.timeout = self.timeout;
+            request.redirect_policy = self.get_redirect_policy();
+
             if !self.interceptors.is_empty() {
                 request.interceptors = self.interceptors.clone();
             }
+
+            // Default headers are validated at add_default_header() time.
+            request.headers.extend(self.default_headers.iter().cloned());
+
+            // HttpRequest::new() defaults to a host-scoped allow list, which is
+            // strictly tighter than the builder's deny-list-only validator.
+            // Merge the builder's private-network denials into it rather than
+            // replacing it, so widening scope here cannot silently permit more
+            // hosts than a bare HttpRequest would.
+            if self.check_private_ips {
+                request.scope_validator = request.scope_validator.with_deny_list([
+                    "0.0.0.0",
+                    "10.*",
+                    "100.64.*",
+                    "127.0.0.1",
+                    "169.254.*",
+                    "172.16.*",
+                    "192.168.*",
+                    "198.18.*",
+                    "224.*",
+                    "240.*",
+                    "localhost",
+                    "*.localhost",
+                    "*.local",
+                    "*.internal",
+                ]);
+            }
+
             request
         })
     }
@@ -259,5 +341,74 @@ mod tests {
             .add_interceptor(Arc::new(AuthInterceptor::new("token")));
         let request = builder.create_request(Method::GET, "users").unwrap();
         assert_eq!(request.interceptors.len(), 1);
+    }
+
+    #[test]
+    fn created_requests_inherit_timeout_and_default_headers() {
+        // These were silently dropped before: create_request() built a request
+        // with the 30s default and none of the builder's headers.
+        let builder = HttpClientBuilder::default()
+            .with_base_url("https://8.8.8.8/")
+            .with_timeout(Duration::from_secs(7))
+            .add_default_header("X-Api-Client", "beanstream")
+            .unwrap();
+        let request = builder.create_request(Method::GET, "users").unwrap();
+        assert_eq!(request.timeout, Duration::from_secs(7));
+        assert!(request
+            .headers
+            .iter()
+            .any(|(name, value)| name == "x-api-client" && value == "beanstream"));
+    }
+
+    #[test]
+    fn redirect_policy_is_active_even_when_not_following_redirects() {
+        // P1-4: host validation used to be gated on follow_redirects, so the
+        // default (false) made the policy inert. It must still enforce the
+        // redirect limit and the scheme rules.
+        let policy = HttpClientBuilder::default()
+            .with_max_redirects(2)
+            .get_redirect_policy();
+
+        assert!(!policy.follow_redirects);
+        assert_eq!(policy.max_redirects, 2);
+
+        // Redirect limit still applies.
+        let previous = vec![
+            Url::parse("https://example.com/one").unwrap(),
+            Url::parse("https://example.com/two").unwrap(),
+        ];
+        assert!(matches!(
+            policy.check_redirect(&previous, &Url::parse("https://example.com/three").unwrap()),
+            Err(BeanStreamError::TooManyRedirects(2))
+        ));
+
+        // Non-http(s) schemes are still refused.
+        assert!(policy
+            .check_redirect(&[], &Url::parse("ftp://example.com/f").unwrap())
+            .is_err());
+    }
+
+    #[test]
+    fn redirect_policy_seeds_allow_list_from_base_url() {
+        // P1-4: with a base URL configured, redirects back to that host are
+        // permitted rather than the allow list being empty.
+        let policy = HttpClientBuilder::default()
+            .with_base_url("https://api.example.com/v1/")
+            .get_redirect_policy();
+        assert!(policy
+            .check_redirect(&[], &Url::parse("https://api.example.com/next").unwrap())
+            .is_ok());
+        assert!(policy
+            .check_redirect(&[], &Url::parse("https://evil.com/next").unwrap())
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn builder_send_goes_through_the_pinned_path() {
+        // P1-1: the builder's send() must refuse a private-resolving host
+        // instead of handing a raw client to reqwest.
+        let builder = HttpClientBuilder::default();
+        let outcome = builder.send(Method::GET, "http://127.0.0.1/").await;
+        assert!(outcome.is_err(), "builder send must validate the target");
     }
 }

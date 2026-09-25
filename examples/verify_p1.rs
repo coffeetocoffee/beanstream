@@ -3,6 +3,8 @@
 
 use std::time::Duration;
 
+use reqwest::Method;
+
 use beanstream::{HttpRequest, HttpResponse};
 
 /// Minimal HTTP/1.1 server that echoes a `Set-Cookie` and `Authorization`
@@ -125,6 +127,27 @@ async fn main() {
         "expected private-network rejection, got {outcome}"
     );
     println!("P1-1 PASS: rejected before connect");
+
+    // --- P1-4 / P1-1: the builder path must validate, not bypass ---
+    let builder = beanstream::HttpClientBuilder::default()
+        .with_timeout(Duration::from_secs(5))
+        .with_max_redirects(3);
+
+    let outcome = format!("{:?}", builder.send(Method::GET, "http://127.0.0.1/").await);
+    println!("P1-4 builder.send() to private host: {outcome}");
+    assert!(
+        outcome.contains("PrivateNetworkAccess") || outcome.contains("denied"),
+        "builder must validate its target, got {outcome}"
+    );
+    println!("P1-4 PASS: builder validates targets");
+
+    // Builder-created requests must inherit settings that were dropped before.
+    let built = builder
+        .create_request(Method::GET, "https://8.8.8.8/x")
+        .unwrap();
+    assert_eq!(built.timeout, Duration::from_secs(5));
+    assert_eq!(built.redirect_policy.max_redirects, 3);
+    println!("P1-4 PASS: created request inherits timeout + redirect limit");
 
     let _: Option<HttpResponse> = None;
 }
