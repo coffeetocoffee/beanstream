@@ -40,6 +40,12 @@ pub enum BeanStreamError {
     InternalError(String),
     #[error("Request was aborted")]
     RequestAborted,
+    #[error("Certificate pinning failed: {0}")]
+    CertificatePinningFailed(String),
+    #[error("WebSocket error: {0}")]
+    WebSocketError(String),
+    #[error("Streaming error: {0}")]
+    StreamingError(String),
 }
 
 impl From<url::ParseError> for BeanStreamError {

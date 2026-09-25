@@ -7,6 +7,7 @@ use reqwest::{Client, Method};
 use crate::abort::AbortSignal;
 use crate::cache::InMemoryCache;
 use crate::header_validation::{is_blocked_header, sanitize_header, validate_headers};
+use crate::interceptor::InterceptorChain;
 use crate::progress::UploadProgress;
 use crate::rate_limit::RateLimiter;
 use crate::redirect_policy::{RedirectPolicy, ScopeValidator};
@@ -51,6 +52,7 @@ pub struct HttpRequest {
     pub retry: Option<RetryConfig>,
     pub cache: Option<Arc<InMemoryCache>>,
     pub rate_limiter: Option<RateLimiter>,
+    pub interceptors: InterceptorChain,
     progress: Option<Arc<dyn UploadProgress>>,
 }
 
@@ -70,6 +72,7 @@ impl std::fmt::Debug for HttpRequest {
             .field("retry", &self.retry)
             .field("cache", &self.cache.is_some())
             .field("rate_limiter", &self.rate_limiter.is_some())
+            .field("interceptors", &self.interceptors.len())
             .field("has_progress", &self.progress.is_some())
             .finish()
     }
@@ -90,6 +93,7 @@ impl Clone for HttpRequest {
             retry: self.retry.clone(),
             cache: self.cache.clone(),
             rate_limiter: self.rate_limiter.clone(),
+            interceptors: self.interceptors.clone(),
             progress: self.progress.clone(),
         }
     }
@@ -134,6 +138,7 @@ impl HttpRequest {
             retry: None,
             cache: None,
             rate_limiter: None,
+            interceptors: InterceptorChain::new(),
             progress: None,
         })
     }
@@ -225,6 +230,22 @@ impl HttpRequest {
     /// Attach a semaphore-based rate limiter (P0-6).
     pub fn with_rate_limiter(mut self, rate_limiter: RateLimiter) -> Self {
         self.rate_limiter = Some(rate_limiter);
+        self
+    }
+
+    /// Register a middleware interceptor (P0-7). Interceptors run in
+    /// registration order around the request/response cycle.
+    pub fn add_interceptor(
+        mut self,
+        interceptor: std::sync::Arc<dyn crate::interceptor::Interceptor>,
+    ) -> Self {
+        self.interceptors.add(interceptor);
+        self
+    }
+
+    /// Replace the whole interceptor chain (P0-7).
+    pub fn with_interceptors(mut self, chain: InterceptorChain) -> Self {
+        self.interceptors = chain;
         self
     }
 
@@ -330,7 +351,12 @@ impl HttpRequest {
                         }
                     }
 
-                    let mut response = HttpResponse { status, headers, body, url };
+                    let mut response = HttpResponse {
+                        status,
+                        headers,
+                        body,
+                        url,
+                    };
 
                     if status == 304 {
                         if cacheable {
@@ -421,21 +447,27 @@ impl HttpRequest {
 
     /// Execute the request — actually sends over the network (P0-1).
     /// Honors `AbortSignal` (P0-2), `UploadProgress` (P0-3), retry (P0-4),
-    /// cache (P0-5), and rate limiting (P0-6).
+    /// cache (P0-5), rate limiting (P0-6), and interceptors (P0-7).
     pub async fn send(&self) -> Result<HttpResponse> {
-        if let Some(signal) = &self.abort_signal {
+        let interceptors = self.interceptors.clone();
+        let mut this = self.clone();
+        interceptors.run_on_request(&mut this)?;
+
+        let outcome = if let Some(signal) = &this.abort_signal {
             if signal.is_aborted() {
                 return Err(BeanStreamError::RequestAborted);
             }
-            // Clone self to move into async branch
-            let this = self.clone();
             tokio::select! {
                 res = this.execute_inner() => res,
                 _ = signal.cancelled() => Err(BeanStreamError::RequestAborted),
             }
         } else {
-            self.execute_inner().await
-        }
+            this.execute_inner().await
+        };
+
+        let mut response = outcome?;
+        interceptors.run_on_response(&mut response)?;
+        Ok(response)
     }
 
     /// Convenience: send consuming self.

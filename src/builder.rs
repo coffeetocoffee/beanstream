@@ -4,7 +4,9 @@ use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use reqwest::Method;
 use url::Url;
 
+use crate::cert_pinning::CertPinConfig;
 use crate::header_validation::{is_blocked_header, sanitize_header};
+use crate::interceptor::InterceptorChain;
 use crate::redirect_policy::{RedirectPolicy, ScopeValidator};
 use crate::request_handler::HttpRequest;
 use crate::{BeanStreamError, Result};
@@ -19,6 +21,8 @@ pub struct HttpClientBuilder {
     user_agent: String,
     default_headers: Vec<(String, String)>,
     check_private_ips: bool,
+    cert_pinning: Option<CertPinConfig>,
+    interceptors: InterceptorChain,
 }
 
 impl Default for HttpClientBuilder {
@@ -32,6 +36,8 @@ impl Default for HttpClientBuilder {
             user_agent: "BeanStream/1.0".to_string(),
             default_headers: Vec::new(),
             check_private_ips: true,
+            cert_pinning: None,
+            interceptors: InterceptorChain::new(),
         }
     }
 }
@@ -87,6 +93,23 @@ impl HttpClientBuilder {
         self
     }
 
+    /// Require every TLS connection to match one of the configured SPKI
+    /// SHA-256 pins (P0-9).
+    pub fn with_cert_pinning(mut self, config: CertPinConfig) -> Self {
+        self.cert_pinning = Some(config);
+        self
+    }
+
+    /// Register a middleware interceptor on every request created by this
+    /// builder (P0-7).
+    pub fn add_interceptor(
+        mut self,
+        interceptor: std::sync::Arc<dyn crate::interceptor::Interceptor>,
+    ) -> Self {
+        self.interceptors.add(interceptor);
+        self
+    }
+
     pub fn build(self) -> Result<reqwest::Client> {
         let user_agent = HeaderValue::from_str(&self.user_agent)
             .map_err(|_| BeanStreamError::InvalidConfiguration("Invalid user agent".to_string()))?;
@@ -112,6 +135,11 @@ impl HttpClientBuilder {
             headers.insert(name, value);
         }
         client = client.default_headers(headers);
+
+        if let Some(pinning) = &self.cert_pinning {
+            let tls_config = pinning.build_rustls_config()?;
+            client = client.use_preconfigured_tls(tls_config);
+        }
 
         client.build().map_err(Into::into)
     }
@@ -164,7 +192,12 @@ impl HttpClientBuilder {
             ));
         };
 
-        HttpRequest::new(method, &url)
+        HttpRequest::new(method, &url).map(|mut request| {
+            if !self.interceptors.is_empty() {
+                request.interceptors = self.interceptors.clone();
+            }
+            request
+        })
     }
 }
 
@@ -207,5 +240,24 @@ mod tests {
     fn requires_base_url_for_relative_targets() {
         let result = HttpClientBuilder::default().create_request(Method::GET, "users");
         assert!(matches!(result, Err(BeanStreamError::MissingConfig(_))));
+    }
+
+    #[test]
+    fn builds_a_client_with_certificate_pinning() {
+        let config = CertPinConfig::new().pin_spki_sha256([0x11; 32]);
+        let builder = HttpClientBuilder::default().with_cert_pinning(config);
+        assert!(builder.build().is_ok());
+    }
+
+    #[test]
+    fn attaches_builder_interceptors_to_created_requests() {
+        use crate::interceptor::AuthInterceptor;
+        use std::sync::Arc;
+
+        let builder = HttpClientBuilder::default()
+            .with_base_url("https://8.8.8.8/")
+            .add_interceptor(Arc::new(AuthInterceptor::new("token")));
+        let request = builder.create_request(Method::GET, "users").unwrap();
+        assert_eq!(request.interceptors.len(), 1);
     }
 }

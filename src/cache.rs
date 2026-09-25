@@ -146,11 +146,7 @@ impl InMemoryCache {
             self.entries.remove(&key);
             return;
         }
-        let oldest: Option<String> = self
-            .entries
-            .iter()
-            .next()
-            .map(|e| e.key().clone());
+        let oldest: Option<String> = self.entries.iter().next().map(|e| e.key().clone());
         if let Some(key) = oldest {
             self.entries.remove(&key);
         }
@@ -233,7 +229,10 @@ mod tests {
         let cache = InMemoryCache::default();
         cache.insert(
             "GET",
-            response("https://example.com/a", vec![("cache-control", "max-age=0")]),
+            response(
+                "https://example.com/a",
+                vec![("cache-control", "max-age=0")],
+            ),
         );
         assert!(cache.get("GET", "https://example.com/a").is_none());
     }

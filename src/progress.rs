@@ -24,8 +24,6 @@ impl UploadProgress for NoopProgress {
     }
 }
 
-
-
 /// Report a completed transfer to the tracker, if attached.
 pub(crate) fn report_complete(progress: &Option<Arc<dyn UploadProgress>>, len: u64) -> bool {
     if let Some(p) = progress {
