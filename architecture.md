@@ -15,6 +15,7 @@
 - [Implementation Blueprint](#implementation-blueprint)
 - [Platform Mastery](#platform-mastery)
 - [Testing & Quality](#testing--quality)
+- [Continuous Integration](#continuous-integration)
 - [Deployment Ready](#deployment-ready)
 - [Sustainable Growth](#sustainable-growth)
 - [Final Thoughts](#final-thoughts)
@@ -410,7 +411,7 @@ Build the bedrock of BeanStream with rock-solid fundamentals:
 - ✅ Add header validation and injection prevention
 - ✅ Implement scope checking against allow/deny lists
 - ✅ Create redirect policy engine
-- ✅ Write comprehensive unit tests (>80% coverage)
+- ✅ Write comprehensive unit tests (see [Measured Coverage](#measured-coverage))
 
 ### Phase 2: Advanced Features (Weeks 3-4)
 
@@ -525,7 +526,65 @@ impl reqwest::crypto::tls::CertificatePinner for CertPinConfig {
 
 BeanStream comes with confidence built into every line:
 
-#### Unit Tests Target: 90%+ Coverage
+#### Measured Coverage
+
+This is not a target stated in prose — it is produced by `cargo llvm-cov` on
+every push (see `.github/workflows/ci.yml`), which fails the build if line
+coverage drops below **80%**.
+
+Measured on 2026-09-25 with `cargo llvm-cov --all-features --workspace`:
+
+| Scope | Line coverage | Lines hit / total |
+|-------|---------------|-------------------|
+| **crate total** | **85.3%** | 2888 / 3384 |
+| `header_validation.rs` | 99.2% | 126 / 127 |
+| `platform_config.rs` | 98.8% | 164 / 166 |
+| `retry.rs` | 98.6% | 71 / 72 |
+| `redirect_policy.rs` | 94.6% | 295 / 312 |
+| `rate_limit.rs` | 94.4% | 67 / 71 |
+| `cache.rs` | 92.1% | 198 / 215 |
+| `progress.rs` | 89.7% | 26 / 29 |
+| `url_validation.rs` | 86.9% | 359 / 413 |
+| `cookies.rs` | 84.8% | 28 / 33 |
+| `request_handler.rs` | 84.3% | 829 / 983 |
+| `builder.rs` | 83.9% | 244 / 291 |
+| `interceptor.rs` | 81.9% | 104 / 127 |
+| `websocket.rs` | 80.4% | 41 / 51 |
+| `cert_pinning.rs` | 72.9% | 180 / 247 |
+| `streaming.rs` | 66.9% | 87 / 130 |
+| `abort.rs` | 62.9% | 66 / 105 |
+| `error_handling_impl.rs` | 25.0% | 3 / 12 |
+
+Reproduce locally:
+
+```bash
+cargo llvm-cov --all-features --workspace --summary-only
+cargo llvm-cov report --fail-under-lines 80   # what CI enforces
+```
+
+The low rows are honest and explain themselves. `error_handling_impl.rs` is
+almost entirely `#[derive(Error)]` and `From` impls whose generated code has no
+branches to exercise. `abort.rs` and `streaming.rs` are dominated by the
+`tokio::select!` and `Stream` poll paths that only run on a real in-flight
+transfer, and the network-free test policy (below) deliberately avoids long
+transfers. `cert_pinning.rs` has a large DER-walking surface that needs real
+certificate fixtures. Raising those three is tracked as open work rather than
+claimed as done.
+
+#### Network-Free Test Policy
+
+Every test in this crate runs without network access, so CI is deterministic and
+offline-friendly:
+
+- DNS cases resolve `localhost` from the hosts file, or use the reserved
+  `.invalid` TLD, which is guaranteed never to resolve (RFC 2606).
+- Addresses are never connected to; validation is asserted before any socket
+  exists.
+- Redirect chains are exercised through the pure `plan_hop()` function rather
+  than a live server — which is also the only way to test them, since a
+  localhost redirect chain is correctly rejected as a private address.
+
+#### Unit Test Example
 
 ```rust
 #[cfg(test)]
@@ -592,44 +651,99 @@ Measure against industry standards:
 
 ---
 
+## Continuous Integration
+
+Every push and pull request runs `.github/workflows/ci.yml` on GitHub Actions.
+The jobs are split so a failure points at one thing:
+
+| Job | What it does | Why it exists |
+|-----|--------------|---------------|
+| `lint` | `cargo fmt --check`, `cargo clippy --all-targets` on default, all and no-default features, warnings denied | Style and lints cannot drift between contributors, or between feature sets |
+| `test` | `cargo build`, `cargo test` and `cargo build --release` across a 7-entry matrix | Feature combinations are the P2-2 regression surface |
+| `coverage` | `cargo llvm-cov`, `--fail-under-lines 80`, uploads `lcov.info` | Coverage is measured and floored, not claimed (P2-5) |
+| `docs` | `cargo doc --no-deps --all-features` with `RUSTDOCFLAGS=-D warnings`, plus `cargo test --doc` | Broken intra-doc links fail the build |
+
+The test matrix:
+
+| Entry | OS | Feature args |
+|-------|----|--------------|
+| `default` | ubuntu-latest | *(defaults: `http2`, `rustls-tls`)* |
+| `no-default-features` | ubuntu-latest | `--no-default-features` |
+| `all-features` | ubuntu-latest | `--all-features` |
+| `documented` | ubuntu-latest | `--features cookies,http2,rustls-tls` |
+| `websocket` | ubuntu-latest | `--features websocket` |
+| `windows-msvc` | windows-latest | *(defaults)* |
+| `macos` | macos-latest | *(defaults)* |
+
+`--no-default-features` is in the matrix on purpose: it is the configuration
+where certificate pinning must *fail loudly* rather than build a client that is
+only nominally pinned, and where `use_preconfigured_tls` does not exist. That is
+exactly the kind of bug a default-features-only CI would never see.
+
+The `documented` entry runs the exact command from the README and
+`architecture.md`. If a documented feature stops existing, CI breaks — which is
+the point.
+
+`rust-toolchain.toml` pins the channel and the required components
+(`rustfmt`, `clippy`, `llvm-tools-preview`), so local runs and CI agree.
+
+---
+
 ## Deployment Ready
 
 ### Production Checklist
 
-Before going live, ensure everything's perfect:
+What is actually verified today, and what is not yet. The "not yet" rows are
+tracked work, not marketing.
 
-- ✅ All tests passing (>90% coverage)
-- ✅ Security audit completed
-- ✅ Performance benchmarks within targets
-- ✅ Dependency licenses reviewed
-- ✅ Documentation complete
-- ✅ TypeScript definitions generated
-- ✅ Migration guides written
+| Item | State | Evidence |
+|------|-------|----------|
+| All tests passing | ✅ | 109 unit + 9 API-path + 5 behaviour tests on default features; 114 + 9 + 6 with `--all-features`. Enforced by CI. |
+| Coverage measured and floored | ✅ | 85.3% lines, CI fails under 80% (see [Measured Coverage](#measured-coverage)). |
+| Documented import paths compile | ✅ | `tests/documented_api_paths.rs` imports the crate exactly as README.md shows, so a private-module path breaks the build (P2-7). |
+| Security audit completed | ✅ | `BeanStream_weaknesses.txt`; P0, P1 and P2-1..P2-4 closed. |
+| Lints and formatting enforced | ✅ | CI runs `cargo fmt --check` and `cargo clippy --all-targets -- -D warnings` on default *and* all features. |
+| Docs build warning-free | ✅ | CI runs `cargo doc --no-deps --all-features` with `RUSTDOCFLAGS=-D warnings`. |
+| Public API documented (rustdoc) | ⬜ | Module-level and item docs exist, but the public API is not yet documented to the standard the README promises (P3-3). |
+| Performance benchmarks within targets | ⬜ | No benchmark suite and no measured targets yet. |
+| Dependency licenses reviewed | ⬜ | Licenses are declared in `Cargo.toml`; no automated `cargo-deny` / `cargo-license` gate yet. |
+| TypeScript definitions generated | ⬜ | There is no JS/TS bridge. The npm channel below is a plan, not an artifact. |
+| Migration guides written | ⬜ | Nothing to migrate from before v1.0. |
 
 ### Build Steps
 
+These are the commands CI runs (`.github/workflows/ci.yml`), so they are known
+to pass — not aspirational.
+
 ```bash
 # Code quality gates
-cargo clippy --all-targets
-cargo fmt --check
+cargo fmt --all -- --check
+cargo clippy --all-targets -- -D warnings
+cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-features
 
 # Release build with optimizations
 cargo build --release --features "cookies,http2,rustls-tls"
 
-# Platform-specific compilation
-cargo build --target x86_64-pc-windows-msvc
-cargo build --target aarch64-apple-ios
-cargo build --target x86_64-unknown-linux-gnu
+# Coverage (what CI enforces)
+cargo llvm-cov --all-features --workspace --summary-only
+cargo llvm-cov report --fail-under-lines 80
 ```
 
 ### Distribution Strategy
 
-Multi-channel publishing for maximum reach:
-- crates.io (Rust ecosystem)
-- npm registry (JavaScript bridge)
-- GitHub Releases (binary packages)
-- Docker Hub (containerized runtime)
+Published channels and planned ones, kept separate:
+
+- **crates.io** — the crate is metadata-complete for publishing (`description`,
+  `license`, `readme`, `keywords`, `categories`, `repository`).
+- **GitHub Releases** — used today; each P-batch is a tag (`v0.4.0`–`v0.8.1`).
+- *Planned, not implemented:* an npm/JavaScript bridge and a Docker image.
+  Neither exists in the repository, so nothing is published to those channels.
+
+Note on cross-compilation: `cargo build --target aarch64-apple-ios` and
+`x86_64-unknown-linux-gnu` require those targets and linkers to be installed;
+they are not part of the default CI matrix, which covers Linux, Windows and
+macOS natively.
 
 ---
 

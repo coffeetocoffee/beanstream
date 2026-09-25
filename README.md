@@ -3,6 +3,7 @@
 > **From bean to bit — pure delivery**  
 > *Where security brews perfectly, every single request*
 
+[![CI](https://github.com/coffeetocoffee/beanstream/actions/workflows/ci.yml/badge.svg)](https://github.com/coffeetocoffee/beanstream/actions/workflows/ci.yml)
 [![License: MIT/Apache-2.0](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](LICENSE)
 
 A security-first HTTP client for Rust that keeps your requests as safe as a carefully roasted espresso — fast enough to keep up with your workflow, robust enough to protect your users' data around the clock.
@@ -29,7 +30,7 @@ Every request passes through a stack of independent validation layers. Nothing i
 Before a single connection is attempted, URLs are rigorously checked. Private IPs, loopback addresses, and metadata endpoints are blocked outright — no more SSRF surprises.
 
 ```rust
-use beanstream::url_validation::{validate_url, is_private_or_loopback};
+use beanstream::{is_private_or_loopback, validate_url};
 
 // Public URLs are fine
 let parsed = validate_url("https://8.8.8.8/api")?;
@@ -46,7 +47,7 @@ assert!(validate_url("http://[::1]/").is_err());
 User-provided headers are sanitized against CRLF injection and control characters, and forbidden headers (`Host`, `Content-Length`, `Transfer-Encoding`…) are rejected automatically.
 
 ```rust
-use beanstream::header_validation::sanitize_header;
+use beanstream::sanitize_header;
 
 let (name, value) = sanitize_header(" X-Custom-Header ", " value ")?;
 assert_eq!(name, "x-custom-header"); // normalized
@@ -60,7 +61,7 @@ assert!(sanitize_header("x-test", "value\r\ninjected").is_err()); // injection b
 Sensitive headers (`authorization`, `set-cookie`, `x-api-key`, …) are automatically detected and kept out of logs and responses.
 
 ```rust
-use beanstream::header_validation::is_sensitive_header;
+use beanstream::is_sensitive_header;
 
 assert!(is_sensitive_header("Authorization"));
 assert!(is_sensitive_header("SET-COOKIE"));
@@ -72,7 +73,7 @@ assert!(!is_sensitive_header("content-type"));
 Redirects are tracked and validated against scope policies — stop open-redirect attacks while letting legitimate chains through.
 
 ```rust
-use beanstream::redirect_policy::RedirectPolicy;
+use beanstream::RedirectPolicy;
 use url::Url;
 
 // Strict: only allow this host (and subdomains)
@@ -102,8 +103,8 @@ changes origin loses its sensitive headers and its body, so credentials cannot
 leak to a second host.
 
 ```rust
-use beanstream::redirect_policy::RedirectPolicy;
-use beanstream::request_handler::HttpRequest;
+use beanstream::RedirectPolicy;
+use beanstream::HttpRequest;
 
 async fn fetch() -> Result<(), Box<dyn std::error::Error>> {
     let response = HttpRequest::get("https://example.com/start")?
@@ -122,17 +123,21 @@ async fn fetch() -> Result<(), Box<dyn std::error::Error>> {
 ### Make your first request
 
 ```rust
-use beanstream::request_handler::HttpRequest;
+use beanstream::HttpRequest;
+use std::time::Duration;
 
-fn main() -> Result<()> {
-    let request = HttpRequest::get("https://api.example.com/users")?
-        .add_header("X-Test", "value")?
+fn main() -> Result<(), beanstream::BeanStreamError> {
+    // `add_header` takes `&mut self` so a single call can report which header
+    // was rejected; the ownership-taking `body`/`timeout` follow it.
+    let mut request = HttpRequest::get("https://api.example.com/users")?
         .body("{}")
         .timeout(Duration::from_secs(15));
+    request.add_header("X-Test", "value")?;
 
     request.validate()?;
     let built = request.build_request()?;
     // send with any reqwest client
+    let _ = built;
     Ok(())
 }
 ```
@@ -140,7 +145,7 @@ fn main() -> Result<()> {
 ### Configure a shared client
 
 ```rust
-use beanstream::builder::HttpClientBuilder;
+use beanstream::HttpClientBuilder;
 use std::time::Duration;
 
 let client = HttpClientBuilder::default()
@@ -151,6 +156,10 @@ let client = HttpClientBuilder::default()
     .add_default_header("X-App", "beanstream")?
     .build()?;
 ```
+
+> `build()` returns a plain `reqwest::Client`, which trusts the system resolver
+> and therefore cannot pin addresses. Use `send()` on the builder, or
+> `HttpRequest` directly, when you want the SSRF checks and DNS pinning applied.
 
 ### Builder options at a glance
 
@@ -164,6 +173,8 @@ let client = HttpClientBuilder::default()
 | `with_user_agent(ua)` | Custom User-Agent |
 | `add_default_header(name, value)` | Add a sanitized default header |
 | `allow_private_networks()` | Opt in to private IP access (not recommended) |
+| `with_cert_pinning(cfg)` | SPKI pinning; needs the `rustls-tls` feature |
+| `with_cookie_jar(jar)` | Share session cookies; needs the `cookies` feature |
 
 ### Creating requests
 
@@ -177,13 +188,17 @@ HttpRequest::delete(url)?;
 HttpRequest::patch(url)?;
 ```
 
-Fluent methods chain cleanly:
+Mutation-style methods take `&mut self` and can therefore fail per header;
+ownership-style methods consume and return `Self` and cannot fail:
 
 ```rust
-let req = HttpRequest::post("https://api.example.com/items")?
+use beanstream::HttpRequest;
+use std::time::Duration;
+
+let mut req = HttpRequest::post("https://api.example.com/items")?
     .body(r#"{"name":"espresso"}"#)
-    .timeout(Duration::from_secs(10))
-    .add_headers([("X-Env", "prod"), ("Accept", "application/json")])?;
+    .timeout(Duration::from_secs(10));
+req.add_headers([("X-Env", "prod"), ("Accept", "application/json")])?;
 ```
 
 ---
@@ -193,7 +208,7 @@ let req = HttpRequest::post("https://api.example.com/items")?
 Errors speak human. No more cryptic stack dives.
 
 ```rust
-use beanstream::error_handling_impl::BeanStreamError;
+use beanstream::BeanStreamError;
 
 match HttpRequest::get("http://127.0.0.1/") {
     Err(BeanStreamError::PrivateNetworkAccess(addr)) => {
@@ -266,6 +281,31 @@ Want to help brew something great? Contributions are welcome and appreciated.
 4. Push & open a Pull Request
 
 Keep the code clean: `cargo fmt`, `cargo clippy --all-targets`, and `cargo test --all-features`.
+
+---
+
+## Continuous Integration
+
+Every push and pull request runs `.github/workflows/ci.yml` on GitHub Actions:
+
+| Job | What it covers |
+|-----|----------------|
+| `lint` | `cargo fmt --check` and `cargo clippy --all-targets -- -D warnings`, on default, all and no-default features |
+| `test` | `build` / `test` / `build --release` across 7 entries: default, `--no-default-features`, `--all-features`, `--features cookies,http2,rustls-tls`, `--features websocket`, Windows, macOS |
+| `coverage` | `cargo llvm-cov --all-features`, failing the build under **80%** lines |
+| `docs` | `cargo doc` with `RUSTDOCFLAGS=-D warnings`, plus doc tests |
+
+The suite is deliberately **network-free**: DNS cases use the hosts file or the
+reserved `.invalid` TLD, and nothing connects to a socket. CI is therefore
+deterministic and works offline.
+
+Current coverage is **85.3% of lines** (`cargo llvm-cov --all-features
+--workspace --summary-only`). The per-module table, including which modules are
+below the floor and why, is in `architecture.md`.
+
+`tests/documented_api_paths.rs` imports the crate exactly the way this README
+does, so if an example here stops compiling, CI fails rather than the reader
+finding out.
 
 ---
 

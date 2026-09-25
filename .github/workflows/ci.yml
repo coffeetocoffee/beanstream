@@ -1,0 +1,144 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+    tags: ["v*"]
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Formatting and lints run once: they do not depend on the feature set.
+  lint:
+    name: fmt + clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy (default features)
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: cargo clippy (all features)
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      # `--no-default-features` is its own leg: cfg-gated code that compiles
+      # fine with defaults can still break when the gates flip.
+      - name: cargo clippy (no default features)
+        run: cargo clippy --all-targets --no-default-features -- -D warnings
+
+  # The feature matrix is the point of P2-2: the documented build command must
+  # keep working, and no feature combination may regress to a compile error.
+  test:
+    name: test (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: default
+            os: ubuntu-latest
+            args: ""
+          - name: no-default-features
+            os: ubuntu-latest
+            args: "--no-default-features"
+          - name: all-features
+            os: ubuntu-latest
+            args: "--all-features"
+          - name: documented
+            os: ubuntu-latest
+            args: "--features cookies,http2,rustls-tls"
+          - name: websocket
+            os: ubuntu-latest
+            args: "--features websocket"
+          - name: windows-msvc
+            os: windows-latest
+            args: ""
+          - name: macos
+            os: macos-latest
+            args: ""
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo build
+        run: cargo build ${{ matrix.args }}
+
+      # The test suite is network-free by design: DNS cases use the local hosts
+      # file and the reserved `.invalid` TLD, so this is deterministic in CI.
+      - name: cargo test
+        run: cargo test ${{ matrix.args }}
+
+      - name: cargo build --release
+        run: cargo build --release ${{ matrix.args }}
+
+  # P2-5: coverage is measured, not claimed. A floor is enforced so a drop is
+  # visible in CI rather than only in marketing copy.
+  coverage:
+    name: coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+
+      - name: Measure coverage
+        run: cargo llvm-cov --all-features --workspace --lcov --output-path lcov.info
+
+      - name: Enforce coverage floor
+        run: cargo llvm-cov report --fail-under-lines 80
+
+      - name: Upload coverage artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: lcov
+          path: lcov.info
+          if-no-files-found: error
+
+  docs:
+    name: docs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo doc
+        run: cargo doc --no-deps --all-features
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+      - name: cargo test --doc
+        run: cargo test --doc --all-features

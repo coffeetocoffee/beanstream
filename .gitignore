@@ -1,2 +1,6 @@
 /target
 Cargo.lock
+
+# Coverage output (cargo llvm-cov). Uploaded as a CI artifact, not committed.
+lcov.info
+*.profraw
