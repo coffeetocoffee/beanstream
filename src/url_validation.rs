@@ -1,4 +1,4 @@
-use ipnet::{Ipv4Net, Ipv6Net};
+use ipnet::Ipv4Net;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use url::Url;
 
@@ -33,6 +33,65 @@ pub struct ValidatedHost {
     pub ip_addr: Option<IpAddr>,
 }
 
+/// Percent-decode `value` repeatedly so encoded traversal sequences cannot hide
+/// behind multiple rounds of encoding (`%252e%252e` -> `%2e%2e` -> `..`).
+///
+/// Bounded: decoding either reaches a fixed point or hits the iteration cap, so
+/// a hostile input cannot make this loop unbounded.
+fn decode_percent_encoded(value: &str) -> String {
+    const MAX_ROUNDS: usize = 5;
+    let mut current = value.to_string();
+
+    for _ in 0..MAX_ROUNDS {
+        let bytes = current.as_bytes();
+        let mut decoded = Vec::with_capacity(bytes.len());
+        let mut index = 0;
+        let mut changed = false;
+
+        while index < bytes.len() {
+            if bytes[index] == b'%'
+                && index + 2 < bytes.len()
+                && bytes[index + 1].is_ascii_hexdigit()
+                && bytes[index + 2].is_ascii_hexdigit()
+            {
+                let byte = u8::from_str_radix(&current[index + 1..index + 3], 16).unwrap_or(0);
+                decoded.push(byte);
+                changed = true;
+                index += 3;
+            } else {
+                decoded.push(bytes[index]);
+                index += 1;
+            }
+        }
+
+        if !changed {
+            break;
+        }
+        current = String::from_utf8_lossy(&decoded).into_owned();
+    }
+
+    current
+}
+
+/// True when `path` contains a sequence that could escape or confuse path
+/// handling downstream.
+///
+/// Checked against both the raw and the percent-decoded form, so encoded
+/// traversal (`%2e%2e`) is caught and not merely normalized away (P1-6).
+fn path_has_dangerous_sequence(path: &str) -> bool {
+    let candidates = [path.to_string(), decode_percent_encoded(path)];
+
+    candidates.iter().any(|candidate| {
+        let lower = candidate.to_ascii_lowercase();
+
+        // Directory traversal and path separators that should not appear once a
+        // URL has been parsed into a path.
+        ["..", "\\", "%2f", "%5c", "%2e", "%00", "\0", "//"]
+            .iter()
+            .any(|sequence| lower.contains(sequence))
+    })
+}
+
 #[derive(Debug, Clone)]
 pub struct SanitizedPath(String);
 
@@ -45,11 +104,14 @@ impl SanitizedPath {
         &self.0
     }
 
+    /// Detect sequences that could traverse or confuse path handling (P1-6).
+    ///
+    /// This inspects raw and percent-decoded forms. Note that `Url::parse`
+    /// normalizes `..` and `.` segments *before* this type is constructed, so
+    /// this catches what survives parsing (encoded forms, backslashes, NUL) —
+    /// the raw-URL check in [`validate_url`] is what catches literal traversal.
     pub fn contains_dangerous_sequences(&self) -> bool {
-        ["..", "\\", "%2f", "%5c", "%2e"]
-            .iter()
-            .any(|sequence| self.0.to_ascii_lowercase().contains(sequence))
-            || self.0.contains("//")
+        path_has_dangerous_sequence(&self.0)
     }
 }
 
@@ -64,16 +126,6 @@ pub struct ParsedUrl {
 
 fn ipv4_in_network(address: Ipv4Addr, network: [u8; 4], prefix: u8) -> bool {
     Ipv4Net::new(Ipv4Addr::from(network), prefix)
-        .map(|network| network.contains(&address))
-        .unwrap_or(false)
-}
-
-fn ipv6_in_network(address: Ipv6Addr, network: [u16; 8], prefix: u8) -> bool {
-    let network_address = Ipv6Addr::new(
-        network[0], network[1], network[2], network[3], network[4], network[5], network[6],
-        network[7],
-    );
-    Ipv6Net::new(network_address, prefix)
         .map(|network| network.contains(&address))
         .unwrap_or(false)
 }
@@ -95,28 +147,48 @@ pub fn is_private_or_loopback(address: &Ipv4Addr) -> bool {
         || ipv4_in_network(*address, [240, 0, 0, 0], 4)
 }
 
+/// Extract the embedded IPv4 address from an IPv4-mapped (`::ffff:a.b.c.d`)
+/// or IPv4-compatible (`::a.b.c.d`) IPv6 address, if present.
+fn embedded_ipv4(address: &Ipv6Addr) -> Option<Ipv4Addr> {
+    // The standard library already handles both mapped and compatible forms.
+    address.to_ipv4()
+}
+
 pub fn is_ipv6_loopback_or_multicast(address: &Ipv6Addr) -> bool {
     let segments = address.segments();
+
+    // IPv4-mapped / IPv4-compatible: defer to the IPv4 rules on the embedded
+    // address rather than blanket-blocking the whole form (P1-7).
+    if let Some(embedded) = embedded_ipv4(address) {
+        return is_private_or_loopback(&embedded);
+    }
+
+    // Unique-local fc00::/7.
+    let is_unique_local = segments[0] & 0xfe00 == 0xfc00;
+    // Link-local fe80::/10.
+    let is_link_local = segments[0] & 0xffc0 == 0xfe80;
+    // Documentation range 2001:db8::/32.
+    let is_documentation = segments[0] == 0x2001 && segments[1] == 0x0db8;
+
+    // 6to4 (2002::/16): block only when the embedded IPv4 address is itself
+    // private. Previously every 2002:... address was refused regardless of the
+    // embedded address, which rejected legitimate public 6to4 traffic (P1-7).
+    let is_6to4 = segments[0] == 0x2002;
+    let is_6to4_private = is_6to4
+        && is_private_or_loopback(&Ipv4Addr::new(
+            (segments[1] >> 8) as u8,
+            segments[1] as u8,
+            (segments[2] >> 8) as u8,
+            segments[2] as u8,
+        ));
 
     address.is_unspecified()
         || address.is_loopback()
         || address.is_multicast()
-        || segments[0] & 0xfe00 == 0xfc00
-        || segments[0] & 0xffc0 == 0xfe80
-        || (segments[0] == 0x2001 && segments[1] == 0x0db8)
-        || (segments[0] == 0
-            && segments[1] == 0
-            && segments[2] == 0
-            && segments[3] == 0
-            && segments[4] == 0
-            && segments[5] == 0xffff)
-            && is_private_or_loopback(&Ipv4Addr::new(
-                (segments[6] >> 8) as u8,
-                segments[6] as u8,
-                (segments[7] >> 8) as u8,
-                segments[7] as u8,
-            ))
-        || ipv6_in_network(*address, [0x2002, 0, 0, 0, 0, 0, 0, 0], 16)
+        || is_unique_local
+        || is_link_local
+        || is_documentation
+        || is_6to4_private
 }
 
 pub fn is_blocked_ip(address: &IpAddr) -> bool {
@@ -267,7 +339,40 @@ fn validate_path(path: &SanitizedPath) -> Result<()> {
     }
 }
 
+/// Check the *raw* URL string for traversal before `Url::parse` normalizes it
+/// away (P1-6).
+///
+/// `Url::parse` collapses `/api/../secret` to `/secret` and decodes `%2e%2e`,
+/// so by the time a `SanitizedPath` exists the traversal is gone and the check
+/// would pass. Validating the raw input first means traversal is rejected
+/// rather than silently rewritten into a different path than the caller wrote.
+fn validate_raw_url_path(url: &str) -> Result<()> {
+    // Strip scheme://authority so host text (which may legitimately contain
+    // dots, e.g. "example.com") is not scanned as path content, then take only
+    // the path: a query or fragment may legitimately contain '.' or '//'.
+    let after_scheme = url.split_once("://").map(|(_, rest)| rest).unwrap_or(url);
+    let path = match after_scheme.find('/') {
+        Some(start) => {
+            let from_start = &after_scheme[start..];
+            let end = from_start.find(['?', '#']).unwrap_or(from_start.len());
+            &from_start[..end]
+        }
+        None => return Ok(()),
+    };
+
+    if path_has_dangerous_sequence(path) {
+        return Err(BeanStreamError::UrlError(
+            "URL path contains a dangerous sequence".to_string(),
+        ));
+    }
+
+    Ok(())
+}
+
 pub fn validate_url(url: &str) -> Result<ParsedUrl> {
+    // P1-6: reject traversal in the raw input before parsing normalizes it.
+    validate_raw_url_path(url)?;
+
     let parsed = Url::parse(url)?;
     let scheme = Scheme::parse_scheme(parsed.scheme())
         .ok_or_else(|| BeanStreamError::InvalidScheme(parsed.scheme().to_string()))?;
@@ -375,6 +480,58 @@ mod tests {
         }
     }
 
+    /// P1-7: an IPv4-mapped IPv6 address is judged by its embedded IPv4
+    /// address, not blocked by shape alone.
+    #[test]
+    fn ipv4_mapped_ipv6_follows_the_embedded_ipv4_rules() {
+        assert!(is_blocked_ip(&IpAddr::V6(
+            "::ffff:127.0.0.1".parse::<Ipv6Addr>().unwrap()
+        )));
+        assert!(is_blocked_ip(&IpAddr::V6(
+            "::ffff:10.0.0.1".parse::<Ipv6Addr>().unwrap()
+        )));
+        assert!(is_blocked_ip(&IpAddr::V6(
+            "::ffff:192.168.1.1".parse::<Ipv6Addr>().unwrap()
+        )));
+        assert!(is_blocked_ip(&IpAddr::V6(
+            "::127.0.0.1".parse::<Ipv6Addr>().unwrap()
+        )));
+
+        assert!(!is_blocked_ip(&IpAddr::V6(
+            "::ffff:8.8.8.8".parse::<Ipv6Addr>().unwrap()
+        )));
+        assert!(!is_blocked_ip(&IpAddr::V6(
+            "::ffff:1.1.1.1".parse::<Ipv6Addr>().unwrap()
+        )));
+    }
+
+    /// P1-7: 6to4 is blocked only when the embedded IPv4 is private, instead of
+    /// rejecting the entire 2002::/16 range.
+    #[test]
+    fn six_to_four_is_blocked_only_for_private_embedded_addresses() {
+        // 2002:7f00:0001:: == embedded 127.0.0.1 -> private, blocked.
+        assert!(is_blocked_ip(&IpAddr::V6(
+            "2002:7f00:1::".parse::<Ipv6Addr>().unwrap()
+        )));
+        // 2002:c0a8:0101:: == embedded 192.168.1.1 -> private, blocked.
+        assert!(is_blocked_ip(&IpAddr::V6(
+            "2002:c0a8:101::".parse::<Ipv6Addr>().unwrap()
+        )));
+        // 2002:0808:0808:: == embedded 8.8.8.8 -> public, allowed.
+        assert!(!is_blocked_ip(&IpAddr::V6(
+            "2002:808:808::".parse::<Ipv6Addr>().unwrap()
+        )));
+    }
+
+    #[test]
+    fn public_ipv6_addresses_are_allowed() {
+        for address in ["2606:4700:4700::1111", "2001:4860:4860::8888"] {
+            assert!(!is_blocked_ip(&IpAddr::V6(
+                address.parse::<Ipv6Addr>().unwrap()
+            )));
+        }
+    }
+
     #[test]
     fn rejects_invalid_urls_and_credentials() {
         assert!(validate_url("ftp://8.8.8.8/file").is_err());
@@ -383,28 +540,56 @@ mod tests {
         assert!(validate_url("not a URL").is_err());
     }
 
+    /// P1-6: traversal is rejected at the raw-URL stage instead of being
+    /// silently normalized into a different path than the caller asked for.
     #[test]
     fn rejects_dangerous_paths() {
+        for url in [
+            "https://8.8.8.8/api/../secret",
+            "https://8.8.8.8/api/%2e%2e/secret",
+            "https://8.8.8.8/api/%2E%2E/secret",
+            "https://8.8.8.8/api/..%2fsecret",
+            "https://8.8.8.8/api/%252e%252e/secret",
+            "https://8.8.8.8/api\\windows",
+            "https://8.8.8.8/api/%5cwindows",
+            "https://8.8.8.8/api/%2fetc/passwd",
+        ] {
+            let error = format!("{:?}", validate_url(url).unwrap_err());
+            assert!(
+                error.contains("dangerous sequence"),
+                "{url} should be rejected as a dangerous path, got {error}"
+            );
+        }
+    }
+
+    /// Traversal hidden in the query string is not a path escape: the path
+    /// itself is still clean, so the request goes through.
+    #[test]
+    fn query_string_traversal_does_not_block_a_clean_path() {
+        let parsed = validate_url("https://example.com/api?next=/../admin").unwrap();
+        assert_eq!(parsed.path.as_str(), "/api");
+    }
+
+    /// Ordinary paths with dots in them must still work (no false positives).
+    #[test]
+    fn accepts_ordinary_paths() {
         assert_eq!(
-            validate_url("https://8.8.8.8/api/../secret")
+            validate_url("https://example.com/api/v1/items.json")
                 .unwrap()
                 .path
                 .as_str(),
-            "/secret"
+            "/api/v1/items.json"
         );
         assert_eq!(
-            validate_url("https://8.8.8.8/api/%2e%2e/secret")
+            validate_url("https://example.com/a.b/c.d-e_f")
                 .unwrap()
                 .path
                 .as_str(),
-            "/secret"
+            "/a.b/c.d-e_f"
         );
         assert_eq!(
-            validate_url("https://8.8.8.8/api\\windows")
-                .unwrap()
-                .path
-                .as_str(),
-            "/api/windows"
+            validate_url("https://example.com/").unwrap().path.as_str(),
+            "/"
         );
     }
 
